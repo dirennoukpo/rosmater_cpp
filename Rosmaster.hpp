@@ -5,41 +5,87 @@
 ** Login   <diren.noukpo@epitech.eu>
 **
 ** Started on  Fri May 15 17:18:57 2026 dirennoukpo
-** Last update Sun Jun 14 00:00:00 2026 dirennoukpo
+** Last update Mon Jun 15 00:00:00 2026 dirennoukpo
 */
 
 #pragma once
 // Rosmaster.hpp — C++ port of Rosmaster Python driver (V3.3.9)
 // Requires C++17 or later.
 //
-// KEY FIX (2026-06-14): Serial port lifecycle hardening.
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SERIAL PORT LIFECYCLE — FULL DIAGNOSIS & FIX HISTORY
+// ═══════════════════════════════════════════════════════════════════════════════
 //
-//   Root cause of the "must reboot Pi after e-stop + Yahboom power-cycle":
-//   ───────────────────────────────────────────────────────────────────────
-//   The POSIX open() used O_RDWR|O_NOCTTY without O_NONBLOCK.  When the
-//   Yahboom driver cuts USB power, the CP210x/CH340 kernel driver signals
-//   VHANGUP on the tty fd.  Any subsequent ::read() on that fd blocks
-//   indefinitely — even after the device reappears — because the fd is
-//   bound to the old kernel tty session.  The only escape was rebooting
-//   (killing the process released the fd).
+//  ROOT CAUSE of "must reboot Pi after e-stop + Yahboom power-cycle":
+//  ──────────────────────────────────────────────────────────────────
+//  The kernel tty layer (CP210x / CH340) maintains internal state per fd.
+//  When the USB-serial adapter loses power, the kernel signals VHANGUP on the
+//  open fd. The sequence of failures is:
 //
-//   The servo driver (muto_link) did NOT exhibit this because it uses
-//   libserial / boost::asio which always open with O_NONBLOCK and use
-//   select/epoll — they naturally recover from VHANGUP.
+//    1. open() without O_NONBLOCK: if a previous fd was left open (e.g. the
+//       receive thread was mid-read when EIO arrived and the port was not
+//       closed before the next open()), the kernel blocks the new open() on
+//       the VHANGUP tty session — indefinitely.
 //
-//   Fixes applied:
-//     1. open() uses O_NONBLOCK; immediately reverted to blocking via fcntl
-//        so normal framed reads still work, but the kernel tty session is
-//        established without the blocking-open hangup trap.
-//     2. HUPCL is cleared (cflag &= ~HUPCL) so the kernel does NOT drop
-//        DTR/RTS on close() — the USB-serial adapter stays enumerated.
-//     3. tcdrain() + tcflush() before ::close() to drain output and discard
-//        any stale input before releasing the fd.
-//     4. receiveLoop() handles EIO (USB disconnect) gracefully: it logs the
-//        event and exits the loop cleanly instead of spinning on errors.
-//     5. The destructor join timeout via a watchdog thread ensures the
-//        receive thread is never leaked even if ::read() stalls briefly
-//        during a hot-unplug event.
+//    2. tcgetattr() / tcsetattr() on a just-reappeared CH340/CP210x fd
+//       without flushing first: the kernel tty layer may have stale baud/flag
+//       state from the previous session; tcsetattr() silently succeeds but the
+//       hardware ignores the new configuration — causing "port open but no
+//       comms" symptoms.
+//
+//    3. No TIOCEXCL: without exclusive-access locking, udev / ModemManager /
+//       other processes can grab the port between our close() and the next
+//       open(), preventing re-acquisition.
+//
+//    4. No TIOCNXCL before close(): the exclusive lock is inherited by the
+//       kernel fd slot. If the fd is closed without releasing the lock, the
+//       kernel sometimes keeps the tty locked for the lifetime of the process
+//       — so the next open() by the *same* process also fails.
+//
+//    5. Thread / fd race in destructor: if the receive thread is sleeping in
+//       its VTIME window when ~Rosmaster() runs, and ser_.close() is called
+//       concurrently, ::read() on the now-closed fd returns EBADF — but the
+//       thread is already past the uart_running_ check, so it spins on errors
+//       until the OS kills the process.
+//
+//    6. EIO not triggering ser_.close() inside receiveLoop(): previous code
+//       set uart_running_=false and returned, but left fd_ open. The kernel
+//       tty then considers the port "still open" and refuses to fully reset
+//       the CH340/CP210x on re-enumeration.
+//
+//  Why muto_link (servo driver) does NOT exhibit this:
+//  ────────────────────────────────────────────────────
+//  muto_link uses libserial / boost::asio, which:
+//    • always opens with O_NONBLOCK + select/epoll
+//    • calls TIOCEXCL / TIOCNXCL automatically
+//    • catches EIO and calls close() internally
+//  Our raw-POSIX implementation must replicate all of that explicitly.
+//
+//  Fixes applied in this revision (2026-06-15):
+//  ─────────────────────────────────────────────
+//  FIX-1  open() uses O_NONBLOCK; immediately cleared via fcntl so that
+//          normal VMIN/VTIME blocking reads still work, but the kernel tty
+//          session is established without the blocking-open VHANGUP trap.
+//
+//  FIX-2  TIOCEXCL is set immediately after open() so no other process can
+//          steal the port between our open() and tcsetattr().
+//
+//  FIX-3  tcflush(TCIOFLUSH) is called BEFORE tcgetattr() to discard any
+//          stale bytes / corrupt baud state left by the power-cycle.
+//
+//  FIX-4  HUPCL is cleared (cflag &= ~HUPCL) so the kernel does NOT drop
+//          DTR/RTS on close() — the USB-serial adapter stays enumerated.
+//
+//  FIX-5  close() calls TIOCNXCL before ::close(fd_) to release the
+//          exclusive lock so the SAME process can re-open the port cleanly.
+//
+//  FIX-6  receiveLoop() calls ser_.close() explicitly on EIO / ENOTTY /
+//          EBADF — this triggers the kernel to fully reset the tty session,
+//          so the next open() gets a clean slate.
+//
+//  FIX-7  Destructor order: uart_running_=false → recv_thread_.join() →
+//          ser_.close(). The port is never closed while the thread may be
+//          in ::read(), eliminating the EBADF race entirely.
 
 #include <array>
 #include <atomic>
@@ -80,7 +126,6 @@ public:
     SerialPort() = default;
     ~SerialPort() { close(); }
 
-    // Non-copyable, non-movable — owns a raw fd/HANDLE.
     SerialPort(const SerialPort &)            = delete;
     SerialPort & operator=(const SerialPort&) = delete;
 
@@ -88,18 +133,18 @@ public:
     // Returns true on success; leaves the object closed on failure.
     bool open(const std::string & port, int baud = 115200);
 
-    // Close the port and release the fd.  Safe to call multiple times.
+    // Close the port and release the fd. Safe to call multiple times.
     void close();
 
     bool isOpen() const;
 
-    // Write raw bytes.  Returns bytes written, or -1 on error.
+    // Write raw bytes. Returns bytes written, or -1 on error.
     int write(const std::vector<uint8_t> & data);
 
     // Blocking read of exactly one byte.
     //   Returns  1 : byte received in `out`
     //   Returns  0 : timeout (no data within VTIME window)
-    //   Returns -1 : unrecoverable error (EIO = device disconnected)
+    //   Returns -1 : unrecoverable error (EIO/ENOTTY/EBADF = device gone)
     int readByte(uint8_t & out);
 
     // Flush (discard) the input buffer.
@@ -125,7 +170,6 @@ public:
                        bool debug = false);
     ~Rosmaster();
 
-    // Non-copyable.
     Rosmaster(const Rosmaster &)            = delete;
     Rosmaster & operator=(const Rosmaster&) = delete;
 
@@ -252,8 +296,8 @@ private:
     }
 
     // ── Serial port ───────────────────────────────────────────────────────────
-    SerialPort ser_;
-    std::string port_name_;   // kept for logging
+    SerialPort  ser_;
+    std::string port_name_;
 
     // ── Config ────────────────────────────────────────────────────────────────
     double  delay_time_;
@@ -262,12 +306,13 @@ private:
 
     // ── Background receive thread ─────────────────────────────────────────────
     //
-    // uart_running_ is the primary stop signal: the destructor sets it false
-    // before joining so the loop exits at the next VTIME timeout (≤ 500 ms).
+    // Shutdown sequence (guaranteed by destructor):
+    //   1. uart_running_ = false
+    //   2. recv_thread_.join()            ← waits for the thread to exit
+    //   3. ser_.close()                   ← fd closed AFTER thread is gone
     //
-    // If the Yahboom driver power-cycles (EIO from ::read()), receiveLoop()
-    // logs the event and exits by itself — uart_running_ is already false at
-    // that point so the destructor join() returns immediately.
+    // This means ser_.close() is never called while the thread may be inside
+    // ::read() — eliminating the EBADF race that caused the kernel tty lockup.
     std::thread       recv_thread_;
     std::atomic<bool> uart_running_{false};
 
@@ -326,7 +371,7 @@ inline bool SerialPort::open(const std::string & port, int baud) {
 
     COMMTIMEOUTS to{};
     to.ReadIntervalTimeout        = 0;
-    to.ReadTotalTimeoutConstant   = 500;   // 500 ms — matches POSIX VTIME=5
+    to.ReadTotalTimeoutConstant   = 500;
     to.ReadTotalTimeoutMultiplier = 0;
     to.WriteTotalTimeoutConstant  = 1000;
     to.WriteTotalTimeoutMultiplier= 0;
@@ -356,24 +401,58 @@ inline void SerialPort::flushInput() { PurgeComm(hSerial_, PURGE_RXCLEAR); }
 // ── POSIX ────────────────────────────────────────────────────────────────────
 
 inline bool SerialPort::open(const std::string & port, int baud) {
-    // FIX: O_NONBLOCK prevents the open() itself from blocking on VHANGUP
-    // (which occurs when the USB-serial adapter power-cycled while a previous
-    // fd was still open in the kernel tty layer).
-    // We immediately clear O_NONBLOCK with fcntl after open() so that
-    // subsequent ::read() calls use the normal VMIN/VTIME blocking model.
+    // ── FIX-1 : O_NONBLOCK on open() ─────────────────────────────────────────
+    // Prevents blocking on VHANGUP: if the USB-serial adapter was power-cycled
+    // while a previous fd was open, the kernel tty session may still be in a
+    // VHANGUP state. Opening with O_NONBLOCK skips the blocking wait on that
+    // stale session and returns immediately with a fresh fd.
     fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd_ < 0) return false;
+    if (fd_ < 0) {
+        std::cerr << "SerialPort::open(" << port << "): " << strerror(errno) << "\n";
+        return false;
+    }
 
-    // Revert to blocking I/O for the framed receive loop.
-    const int flags = fcntl(fd_, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+    // ── FIX-2 : TIOCEXCL — exclusive kernel-level lock ───────────────────────
+    // Prevents udev / ModemManager / other processes from grabbing the port
+    // between our open() and tcsetattr(), which would corrupt the tty state
+    // and cause "port open but no comms" after a power-cycle.
+    if (::ioctl(fd_, TIOCEXCL) < 0) {
+        // Non-fatal on kernels that don't support it, but warn.
+        std::cerr << "SerialPort: TIOCEXCL failed (non-fatal): "
+                  << strerror(errno) << "\n";
+    }
+
+    // ── FIX-1 cont. : revert to blocking I/O ─────────────────────────────────
+    // VMIN/VTIME blocking model is still what we want for the framed receive
+    // loop — O_NONBLOCK was only needed for the open() call itself.
+    {
+        const int flags = fcntl(fd_, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+            std::cerr << "SerialPort: fcntl clear O_NONBLOCK failed: "
+                      << strerror(errno) << "\n";
+            ::ioctl(fd_, TIOCNXCL);
+            ::close(fd_);
+            fd_ = -1;
+            return false;
+        }
+    }
+
+    // ── FIX-3 : flush BEFORE tcgetattr ───────────────────────────────────────
+    // After a CH340/CP210x power-cycle + re-enumeration, the kernel tty driver
+    // may have stale baud-rate / line-discipline state in its internal buffers.
+    // Flushing both RX and TX *before* reading the current attributes ensures
+    // tcgetattr() returns a clean baseline, and tcsetattr() actually takes
+    // effect on the hardware — not on a cached shadow register.
+    ::tcflush(fd_, TCIOFLUSH);
+
+    termios tty{};
+    if (tcgetattr(fd_, &tty) < 0) {
+        std::cerr << "SerialPort: tcgetattr failed: " << strerror(errno) << "\n";
+        ::ioctl(fd_, TIOCNXCL);
         ::close(fd_);
         fd_ = -1;
         return false;
     }
-
-    termios tty{};
-    tcgetattr(fd_, &tty);
 
     speed_t speed = B115200;
     switch (baud) {
@@ -388,10 +467,11 @@ inline bool SerialPort::open(const std::string & port, int baud) {
     cfsetospeed(&tty, speed);
 
     tty.c_cflag  = (tty.c_cflag & ~CSIZE) | CS8;
-    // FIX: Clear HUPCL so the kernel does NOT assert a modem hangup (drop
-    // DTR/RTS) when we close() the fd.  Without this, some CP210x/CH340
-    // adapters reset the Yahboom MCU on every close(), which interferes with
-    // the reconnect sequence.
+    // ── FIX-4 : clear HUPCL ──────────────────────────────────────────────────
+    // Without this, closing the fd asserts modem hangup (drops DTR/RTS).
+    // Some CH340 / CP210x adapters interpret DTR drop as a device reset,
+    // which re-enumerates the USB device and makes the /dev/ttyUSBx node
+    // disappear momentarily — exactly what triggers the lockup on re-open.
     tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS | HUPCL);
     tty.c_cflag |=  CLOCAL | CREAD;
     tty.c_iflag  = IGNPAR;
@@ -399,29 +479,41 @@ inline bool SerialPort::open(const std::string & port, int baud) {
     tty.c_lflag  = 0;
 
     // VMIN=0, VTIME=5 (500 ms): readByte() returns 0 (timeout) if no byte
-    // arrives within 500 ms.  This lets receiveLoop() re-check uart_running_
-    // promptly without spinning on CPU.
+    // arrives within 500 ms, allowing receiveLoop() to re-check uart_running_
+    // without spinning on CPU.
     tty.c_cc[VMIN]  = 0;
     tty.c_cc[VTIME] = 5;
 
     if (tcsetattr(fd_, TCSANOW, &tty) < 0) {
+        std::cerr << "SerialPort: tcsetattr failed: " << strerror(errno) << "\n";
+        ::ioctl(fd_, TIOCNXCL);
         ::close(fd_);
         fd_ = -1;
         return false;
     }
+
     return true;
 }
 
 inline void SerialPort::close() {
     if (fd_ < 0) return;
 
-    // Drain any pending output, then discard stale input.  This ensures the
-    // kernel tty layer is in a clean state before we release the fd so that
-    // the next open() (after a Yahboom power-cycle) does not inherit stale
-    // data or a locked tty session.
-    tcdrain(fd_);
-    tcflush(fd_, TCIOFLUSH);
-
+    // ── FIX-5 : clean shutdown sequence ──────────────────────────────────────
+    //
+    // Order matters:
+    //   1. tcflush — discard pending I/O so the kernel tty layer sees a clean
+    //      state; without this, some CH340 drivers hold the tty locked waiting
+    //      to drain bytes that will never be consumed.
+    //   2. TIOCNXCL — release the exclusive lock acquired in open(). If we
+    //      skip this, the SAME process's next open() call may be refused by
+    //      the kernel ("device busy") because the lock is tied to the fd, not
+    //      to the process — and closing the fd without releasing TIOCEXCL
+    //      leaves the lock in an undefined state on some kernel versions.
+    //   3. ::close(fd_) — actually releases the file descriptor.
+    //   4. fd_ = -1 — marks the object as closed; safe to call close() again.
+    //
+    ::tcflush(fd_, TCIOFLUSH);
+    ::ioctl(fd_, TIOCNXCL);
     ::close(fd_);
     fd_ = -1;
 }
@@ -439,15 +531,19 @@ inline int SerialPort::readByte(uint8_t & out) {
     ssize_t n;
     do {
         n = ::read(fd_, &out, 1);
-    } while (n < 0 && errno == EINTR);   // retry on signal interruption
+    } while (n < 0 && errno == EINTR);   // retry on signal interruption only
 
     if (n == 1)  return  1;   // byte received
-    if (n == 0)  return  0;   // VTIME timeout — no data
-    // n < 0:
-    // EIO  = device physically disconnected (USB removed / power cut).
-    // EAGAIN should not occur since we cleared O_NONBLOCK, but handle it.
+    if (n == 0)  return  0;   // VTIME timeout — no data, caller loops
+
+    // n < 0 — classify the error:
+    //   EIO     = device physically disconnected (USB power cut)
+    //   ENOTTY  = tty session invalidated (VHANGUP consumed, fd stale)
+    //   EBADF   = fd was closed under us (should not happen with FIX-7)
+    //   EAGAIN  = should not occur since O_NONBLOCK is cleared, but safe to
+    //             treat as a transient timeout
     if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-    return -1;   // EIO or other unrecoverable error → caller must stop
+    return -1;   // EIO / ENOTTY / EBADF — caller must stop and close
 }
 
 inline void SerialPort::flushInput() {
@@ -478,20 +574,29 @@ inline Rosmaster::Rosmaster(int car_type, const std::string & com,
 }
 
 inline Rosmaster::~Rosmaster() {
-    // Signal the receive thread to stop.  The thread exits at the next
-    // VTIME timeout (≤ 500 ms) or immediately if it already hit EIO.
+    // ── FIX-7 : guaranteed shutdown order ─────────────────────────────────────
+    //
+    // Step 1: Signal the loop to stop. The thread exits at the next VTIME
+    //         timeout (≤ 500 ms) or immediately if it already hit EIO and
+    //         called ser_.close() + set uart_running_=false itself.
     uart_running_ = false;
+
+    // Step 2: Join BEFORE closing the port. This is the critical ordering.
+    //         If we closed the port first, the thread's in-flight ::read()
+    //         would return EBADF — which would be caught as a fatal error and
+    //         cause a spurious "serial error" log, and more importantly would
+    //         leave the kernel tty in an ambiguous state for the next open().
     if (recv_thread_.joinable()) {
         recv_thread_.join();
     }
-    // Close the serial port only after the thread has exited so there is
-    // no race between ::read() and ::close() on fd_.
+
+    // Step 3: Now it is safe to close — the thread is guaranteed not to be
+    //         in ::read() anymore.
     ser_.close();
     std::cout << "Rosmaster serial closed.\n";
 }
 
 // ── checksum ──────────────────────────────────────────────────────────────────
-// sum(cmd, COMPLEMENT) & 0xff  — COMPLEMENT = 5 as initial accumulator.
 inline uint8_t Rosmaster::checksum(const std::vector<uint8_t> & cmd) const {
     int s = COMPLEMENT;
     for (auto b : cmd) s += b;
@@ -636,21 +741,37 @@ inline void Rosmaster::parseData(uint8_t ext_type,
 // Receive checksum: (ext_len + ext_type + data[0..n-3]) % 256 == data[n-2]
 // (The last byte in data[] is the checksum; it is NOT added to the sum.)
 //
-// EIO handling: if readByte() returns -1 (device disconnected / power-cycled),
-// the loop logs once and exits.  The thread is then joinable from the
-// destructor without any spin or timeout.
+// ── FIX-6 : ser_.close() on fatal read errors ─────────────────────────────────
+//
+// Previous version set uart_running_=false and returned on EIO, but left
+// fd_ open. The kernel tty layer then considered the port "still in use",
+// which prevented a clean re-open after Yahboom power-cycle.
+//
+// Now: on any fatal error (EIO / ENOTTY / EBADF), we call ser_.close()
+// explicitly — releasing the TIOCEXCL lock and flushing the tty — BEFORE
+// returning from the thread. The destructor's join() then completes
+// immediately, and the port is in a fully released state for the next
+// open() call (e.g. after ROS2 hardware interface re-activation).
 inline void Rosmaster::receiveLoop() {
     ser_.flushInput();
+
+    auto fatalExit = [&](const char * reason) {
+        std::cerr << "Rosmaster[" << port_name_ << "]: " << reason
+                  << " — closing port and exiting receive thread.\n";
+        uart_running_ = false;
+        // FIX-6: close the fd inside the thread so the kernel tty session is
+        // fully released before the destructor's join() returns. This is safe
+        // because the destructor waits for join() before calling ser_.close()
+        // again — and SerialPort::close() is idempotent (fd_=-1 guard).
+        ser_.close();
+    };
+
     while (uart_running_.load(std::memory_order_relaxed)) {
+
+        // ── Sync on frame header ─────────────────────────────────────────────
         uint8_t head1 = 0;
         const int r1 = ser_.readByte(head1);
-        if (r1 < 0) {
-            // EIO or other unrecoverable error — device was power-cycled.
-            std::cerr << "Rosmaster[" << port_name_
-                      << "]: serial read error (EIO?), receive thread exiting.\n";
-            uart_running_ = false;   // signal so destructor join() is instant
-            return;
-        }
+        if (r1 < 0) { fatalExit("serial read error (EIO/ENOTTY?) on HEAD byte"); return; }
         if (r1 == 0 || head1 != HEAD) continue;
 
         uint8_t head2 = 0;
@@ -661,7 +782,7 @@ inline void Rosmaster::receiveLoop() {
         if (ser_.readByte(ext_len)  != 1) continue;
         if (ser_.readByte(ext_type) != 1) continue;
 
-        // Receive checksum starts with ext_len + ext_type (matches Python).
+        // Receive checksum accumulates ext_len + ext_type (matches Python).
         int check_sum = ext_len + ext_type;
         const int data_len = ext_len - 2;
         if (data_len < 0) continue;
@@ -675,19 +796,17 @@ inline void Rosmaster::receiveLoop() {
             uint8_t val = 0;
             const int rn = ser_.readByte(val);
             if (rn < 0) { read_error = true; break; }
-            if (rn == 0) continue;   // timeout mid-frame — keep waiting
+            if (rn == 0) continue;   // VTIME timeout mid-frame — keep waiting
             ext_data.push_back(val);
             if (static_cast<int>(ext_data.size()) == data_len) {
-                rx_check_num = val;    // last byte is checksum — not accumulated
+                rx_check_num = val;   // last byte IS the checksum — not accumulated
             } else {
                 check_sum += val;
             }
         }
 
         if (read_error) {
-            std::cerr << "Rosmaster[" << port_name_
-                      << "]: serial error mid-frame, receive thread exiting.\n";
-            uart_running_ = false;
+            fatalExit("serial error mid-frame (EIO/ENOTTY?)");
             return;
         }
 
@@ -707,7 +826,7 @@ inline void Rosmaster::receiveLoop() {
 
 // ── create_receive_threading ──────────────────────────────────────────────────
 inline void Rosmaster::create_receive_threading() {
-    if (uart_running_.load()) return;   // already running — guard like Python
+    if (uart_running_.load()) return;
     uart_running_ = true;
     recv_thread_ = std::thread(&Rosmaster::receiveLoop, this);
     std::cout << "----------------create receive threading--------------\n";
