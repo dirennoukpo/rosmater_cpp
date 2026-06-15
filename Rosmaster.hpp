@@ -176,6 +176,23 @@ public:
     // ── Threading ────────────────────────────────────────────────────────────
     void create_receive_threading();
 
+    // ── Health check ─────────────────────────────────────────────────────────
+    //
+    // Returns true if the background receive thread is alive and the serial
+    // port has not encountered a fatal error (EIO / ENOTTY / EBADF).
+    //
+    // receiveLoop() sets uart_running_=false and closes the port on any fatal
+    // read error (FIX-6).  The hardware interface calls this once per
+    // read() cycle to detect a Yahboom power-cut without polling the GPIO —
+    // covering the case where the e-stop fires faster than the GPIO pin can
+    // be sampled, or on boards without a dedicated e-stop GPIO.
+    //
+    // Thread-safe: uart_running_ is std::atomic<bool>; load() with
+    // memory_order_relaxed is sufficient — a one-cycle lag is acceptable.
+    bool is_running() const {
+        return uart_running_.load(std::memory_order_relaxed);
+    }
+
     // ── Car control ──────────────────────────────────────────────────────────
     void set_auto_report_state(bool enable, bool forever = false);
     void set_beep(int on_time);
@@ -313,6 +330,9 @@ private:
     //
     // This means ser_.close() is never called while the thread may be inside
     // ::read() — eliminating the EBADF race that caused the kernel tty lockup.
+    //
+    // uart_running_ is also the signal read by is_running() (public health
+    // check API used by MecaMateSystemHardware::reconnect_rosmaster_if_needed).
     std::thread       recv_thread_;
     std::atomic<bool> uart_running_{false};
 
@@ -752,6 +772,10 @@ inline void Rosmaster::parseData(uint8_t ext_type,
 // returning from the thread. The destructor's join() then completes
 // immediately, and the port is in a fully released state for the next
 // open() call (e.g. after ROS2 hardware interface re-activation).
+//
+// is_running() returning false is the external signal used by
+// MecaMateSystemHardware::reconnect_rosmaster_if_needed() to detect that
+// the Yahboom lost power and trigger a clean reconnection attempt.
 inline void Rosmaster::receiveLoop() {
     ser_.flushInput();
 
