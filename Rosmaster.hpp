@@ -790,13 +790,29 @@ inline void Rosmaster::receiveLoop() {
         ser_.close();
     };
 
-    // FIX-SILENCE: CH340/CP210x adapters may never generate EIO when the
-    // Yahboom board loses power — the fd stays open and readByte() returns
-    // only timeouts (0) forever. We treat sustained silence (no valid frame
-    // header received within kSilenceTimeoutMs) as a fatal disconnection,
-    // identical to an EIO, so that reconnect_rosmaster_if_needed() fires.
-    constexpr int kSilenceTimeoutMs = 500;  // 500 ms without a HEAD byte → offline
-    auto last_byte_time = std::chrono::steady_clock::now();
+    // ── FIX-WATCHDOG : silence watchdog ──────────────────────────────────────
+    //
+    // Problem: VTIME=5 (500 ms) means readByte() returns 0 every 500 ms when
+    // the device is gone.  Without a watchdog, receiveLoop() spins in a tight
+    // "r1==0, continue" loop forever, uart_running_ stays true, and
+    // is_running() never detects the offline condition — so
+    // reconnect_rosmaster_if_needed() never fires.
+    //
+    // Fix: track time since the last valid HEAD byte was received.  If no
+    // frame header arrives within kSilenceTimeoutMs (3× VTIME = 1500 ms),
+    // declare the link dead and exit via fatalExit() — which calls ser_.close()
+    // and sets uart_running_=false so is_running() returns false.
+    //
+    // 1500 ms is chosen deliberately:
+    //   • > 1× VTIME (500 ms) so a single timeout doesn't fire spuriously.
+    //   • = 3× VTIME so three consecutive empty reads (worst-case scheduling)
+    //     are needed before the watchdog triggers — avoids false positives on
+    //     brief bursts of silence between auto-report packets (normal operation
+    //     is ~50 Hz, i.e. a packet every 20 ms).
+    //   • Short enough that the hardware interface's 2-second reconnect
+    //     cooldown fires promptly after the Yahboom loses power.
+    constexpr int kSilenceTimeoutMs = 1500;
+    auto last_valid_head = std::chrono::steady_clock::now();
 
     while (uart_running_.load(std::memory_order_relaxed)) {
 
@@ -805,18 +821,18 @@ inline void Rosmaster::receiveLoop() {
         const int r1 = ser_.readByte(head1);
         if (r1 < 0) { fatalExit("serial read error (EIO/ENOTTY?) on HEAD byte"); return; }
         if (r1 == 0 || head1 != HEAD) {
-            // Timeout or non-header byte — check silence watchdog.
+            // No valid byte received — check watchdog.
             const auto now = std::chrono::steady_clock::now();
             const auto silent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_byte_time).count();
+                now - last_valid_head).count();
             if (silent_ms >= kSilenceTimeoutMs) {
-                fatalExit("no data from Yahboom for 500 ms (power cut / e-stop?)");
+                fatalExit("silence watchdog fired — no data for >1500 ms (Yahboom offline?)");
                 return;
             }
             continue;
         }
-        // Valid HEAD byte received — reset the silence watchdog.
-        last_byte_time = std::chrono::steady_clock::now();
+        // Valid HEAD byte received — reset watchdog.
+        last_valid_head = std::chrono::steady_clock::now();
 
         uint8_t head2 = 0;
         if (ser_.readByte(head2) != 1) continue;
