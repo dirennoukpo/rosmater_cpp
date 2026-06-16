@@ -5,7 +5,7 @@
 ** Login   <diren.noukpo@epitech.eu>
 **
 ** Started on  Fri May 15 17:18:57 2026 dirennoukpo
-** Last update Mon Jun 15 00:00:00 2026 dirennoukpo
+** Last update Wed Jun 17 00:00:00 2026 dirennoukpo
 */
 
 #pragma once
@@ -86,6 +86,23 @@
 //  FIX-7  Destructor order: uart_running_=false → recv_thread_.join() →
 //          ser_.close(). The port is never closed while the thread may be
 //          in ::read(), eliminating the EBADF race entirely.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SOFTWARE PID — CHANGELOG
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//  v2 → v3 : separate gain/state structs, real dt, D filter, encoder wrap,
+//             UART check, explicit saturation
+//  v3 → v4 : pre-integration anti-windup (removes rollback inconsistency),
+//             encoder_received_ flag (PID only starts after first packet),
+//             calibrate_pid_scale() enforces duration_ms >= 100
+//  v4 → v5 : [FIXED] typo deriv_filtered → derivative_filtered,
+//             [FIXED] calibrate_pid_scale() guards result <= 0,
+//             [FIXED] measured velocity clamped to [-200, 200],
+//             [FIXED] set_motor() clamps targets to [-100, 100] when PID active,
+//             [FIXED] velocity scale guarded against 0 in pidLoop() (NaN-safe),
+//             [FIXED] encoder_received_ reset on UART reconnect (see parseData),
+//             [NOTE]  PID frequency and integral limit remain tuning parameters
 
 #include <array>
 #include <atomic>
@@ -118,9 +135,9 @@ inline void delay_ms(double ms) {
         std::chrono::microseconds(static_cast<long long>(ms * 1000.0)));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  SerialPort — thin POSIX/Win32 wrapper with robust open/close lifecycle
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 class SerialPort {
 public:
     SerialPort() = default;
@@ -158,9 +175,9 @@ private:
 #endif
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  Rosmaster
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 class Rosmaster {
 public:
     // car_type: 1=X3, 2=X3_PLUS, 4=X1, 5=R2
@@ -182,10 +199,8 @@ public:
     // port has not encountered a fatal error (EIO / ENOTTY / EBADF).
     //
     // receiveLoop() sets uart_running_=false and closes the port on any fatal
-    // read error (FIX-6).  The hardware interface calls this once per
-    // read() cycle to detect a Yahboom power-cut without polling the GPIO —
-    // covering the case where the e-stop fires faster than the GPIO pin can
-    // be sampled, or on boards without a dedicated e-stop GPIO.
+    // read error (FIX-6). The hardware interface calls this once per read()
+    // cycle to detect a Yahboom power-cut without polling the GPIO.
     //
     // Thread-safe: uart_running_ is std::atomic<bool>; load() with
     // memory_order_relaxed is sufficient — a one-cycle lag is acceptable.
@@ -200,7 +215,12 @@ public:
     void set_pwm_servo_all(int angle_s1, int angle_s2, int angle_s3, int angle_s4);
     void set_colorful_lamps(int led_id, int red, int green, int blue);
     void set_colorful_effect(int effect, int speed = 255, int parm = 255);
+
+    // When the software PID is active, stores speed values as setpoints
+    // (clamped to [-100, 100]) for the PID loop. Otherwise sends directly
+    // to the hardware via FUNC_MOTOR.
     void set_motor(double speed_1, double speed_2, double speed_3, double speed_4);
+
     void set_car_run(int state, int speed, bool adjust = false);
     void set_car_motion(double v_x, double v_y, double v_z);
     void set_pid_param(double kp, double ki, double kd, bool forever = false);
@@ -236,7 +256,41 @@ public:
     double                   get_version();
     int                      get_car_type_from_machine();
 
-    // ── Function / car-type constants ─────────────────────────────────────────
+    // ── Software PID control (motor velocity loop) ────────────────────────────
+    //
+    // Enables the software PID loop running at kPidHz.
+    // Preconditions (enforced via exception):
+    //   • create_receive_threading() already called (uart_running_ == true)
+    //   • at least one encoder packet received (encoder_received_ == true)
+    //     → call set_auto_report_state(true) and wait ~100 ms before this
+    // Emits a warning to stderr if calibrate_pid_scale() was not run first.
+    void enable_pid_control(double kp             = 1.8,
+                            double ki             = 0.4,
+                            double kd             = 0.05,
+                            double ticks_per_sec  = 1326.0);
+
+    // Gracefully stops the PID thread, then clears all integrators.
+    // Idempotent — safe to call even if PID was never started.
+    void disable_pid_control();
+
+    // Hot-updates PID gains while the loop is running. Thread-safe.
+    void set_pid_gains(double kp, double ki, double kd);
+
+    // Clears all integrators and zeroes all setpoints.
+    // PRECONDITION: pid_running_ == false (i.e. after disable_pid_control()).
+    // For an in-flight E-stop: call set_motor(0,0,0,0) first to post a zero
+    // setpoint, then disable_pid_control(), then reset_pids() if restarting.
+    void reset_pids();
+
+    // Workshop calibration — robot lifted or area clear, PID must be disabled.
+    // Spins all four motors at 100% for duration_ms and measures encoder ticks.
+    // Throws std::invalid_argument if duration_ms < 100 (too few ticks).
+    // Throws std::runtime_error   if no encoder ticks were measured
+    //   (check UART connection, wiring, and set_auto_report_state).
+    // Returns the measured ticks_per_second_at_100pct_ (average over 4 motors).
+    double calibrate_pid_scale(int duration_ms = 300);
+
+    // ── Protocol / car-type constants ─────────────────────────────────────────
     static constexpr uint8_t FUNC_AUTO_REPORT      = 0x01;
     static constexpr uint8_t FUNC_BEEP             = 0x02;
     static constexpr uint8_t FUNC_PWM_SERVO        = 0x03;
@@ -289,6 +343,10 @@ private:
     int     armConvertValue(int s_id, int s_angle) const;
     int     armConvertAngle(int s_id, int s_value) const;
 
+    // ── Software PID internal methods ─────────────────────────────────────────
+    void pidLoop();
+    void writeMotorRaw(const std::array<double, 4> & cmd);
+
     // ── Little-endian pack/unpack helpers ─────────────────────────────────────
     static int16_t le16s(const std::vector<uint8_t> & d, size_t off) {
         return static_cast<int16_t>(
@@ -302,8 +360,8 @@ private:
     }
     static int32_t le32s(const std::vector<uint8_t> & d, size_t off) {
         return static_cast<int32_t>(
-            static_cast<uint32_t>(d[off])          |
-            (static_cast<uint32_t>(d[off + 1]) << 8)  |
+            static_cast<uint32_t>(d[off])             |
+            (static_cast<uint32_t>(d[off + 1]) <<  8) |
             (static_cast<uint32_t>(d[off + 2]) << 16) |
             (static_cast<uint32_t>(d[off + 3]) << 24));
     }
@@ -325,11 +383,8 @@ private:
     //
     // Shutdown sequence (guaranteed by destructor):
     //   1. uart_running_ = false
-    //   2. recv_thread_.join()            ← waits for the thread to exit
-    //   3. ser_.close()                   ← fd closed AFTER thread is gone
-    //
-    // This means ser_.close() is never called while the thread may be inside
-    // ::read() — eliminating the EBADF race that caused the kernel tty lockup.
+    //   2. recv_thread_.join()   ← waits for the thread to exit
+    //   3. ser_.close()          ← fd closed AFTER thread is gone
     //
     // uart_running_ is also the signal read by is_running() (public health
     // check API used by MecaMateSystemHardware::reconnect_rosmaster_if_needed).
@@ -365,6 +420,92 @@ private:
     std::atomic<bool>    akm_readed_angle_{false};
 
     std::atomic<int>     read_car_type_{0};
+
+    // ── Software PID — structs ────────────────────────────────────────────────
+    //
+    // PidGains      : shared between threads → protected by pid_gains_mutex_
+    // MotorPidState : exclusive to the PID thread → no mutex required
+    //
+    // Pre-integration anti-windup (standard industrial control pattern):
+    //
+    //   raw = target + kp·e + ki·∫ + kd·d_filtered
+    //   if |raw| < 100  →  ∫ += e·dt        (integration allowed)
+    //   cmd = clamp(raw, -100, 100)
+    //
+    // The integrator is updated AFTER the saturation test on the full output
+    // (feedforward included). No post-calculation rollback — no inconsistency
+    // between integrator state and the command actually sent.
+    struct PidGains {
+        double kp{1.8};
+        double ki{0.4};
+        double kd{0.05};
+    };
+
+    struct MotorPidState {
+        double integral{0.0};
+        double prev_error{0.0};
+        double derivative_filtered{0.0};   // EMA filter to suppress quantization noise
+
+        void reset() { integral = prev_error = derivative_filtered = 0.0; }
+    };
+
+    // ── Software PID — members ────────────────────────────────────────────────
+
+    // Shared gains — always accessed under pid_gains_mutex_
+    mutable std::mutex pid_gains_mutex_;
+    PidGains           pid_gains_{};
+
+    // Per-motor state (FL, FR, RL, RR) — exclusive to the PID thread
+    std::array<MotorPidState, 4> motor_state_{};
+
+    // Setpoints deposited by set_motor(), read by pidLoop()
+    std::array<std::atomic<double>, 4> target_{};
+
+    // Reference encoder values from the previous PID cycle — exclusive to PID thread
+    std::array<uint32_t, 4> enc_prev_pid_{0u, 0u, 0u, 0u};
+
+    // Set by parseData() on the first valid FUNC_REPORT_ENCODER packet.
+    // enable_pid_control() refuses to start until this flag is true:
+    // uart_running_==true only means the thread is alive, not that encoder
+    // packets have been received. Without this guard, the PID would start
+    // with velocity measurements of 0,0,0,0 and send a spurious correction.
+    //
+    // IMPORTANT: this flag is reset to false inside receiveLoop() whenever
+    // the thread restarts (i.e. on UART reconnection), so that
+    // enable_pid_control() correctly waits for fresh encoder data.
+    std::atomic<bool> encoder_received_{false};
+
+    // Velocity scale: ticks/s at 100% command output.
+    // Default: 1000 ticks/rev × (0.5 m/s ÷ π×0.12 m) ≈ 1326 ticks/s
+    // This is a conservative fallback — the actual value depends on the
+    // gear ratio of the NFP-JGB37-520 variant fitted to the robot.
+    // Always run calibrate_pid_scale() before field use.
+    double ticks_per_second_at_100pct_{1326.0};
+
+    // True once calibrate_pid_scale() has completed successfully.
+    // Used by enable_pid_control() to emit a warning if calibration was skipped.
+    bool pid_scale_calibrated_{false};
+
+    // Derivative EMA filter coefficient.
+    // τ_eq = α/(1−α) × dt = 0.8/0.2 × 0.01 ≈ 40 ms at 100 Hz.
+    // If you reduce kPidHz, recalculate α to keep τ_eq ≈ 40 ms:
+    //   α = τ_eq / (τ_eq + dt)   with τ_eq = 0.04 s
+    static constexpr double kDerivAlpha = 0.8;
+
+    // PID loop frequency.
+    // 100 Hz is acceptable when Δticks per cycle is typically > 5.
+    // If encoders produce Δticks ≈ 0 or ±1 per cycle (slow gear ratio or
+    // low encoder resolution), reduce to 50 Hz or 20 Hz for a cleaner
+    // velocity estimate. Verify experimentally on your motor variant.
+    static constexpr int  kPidHz     = 100;
+    static constexpr auto kPidPeriod = std::chrono::microseconds(1'000'000 / kPidHz);
+
+    // pid_enabled_: atomic — read by set_motor() (ROS2 thread),
+    //               written by enable/disable (ROS2 thread)
+    std::atomic<bool> pid_enabled_{false};
+
+    std::thread       pid_thread_;
+    std::atomic<bool> pid_running_{false};
 };
 
 // =============================================================================
@@ -421,30 +562,22 @@ inline void SerialPort::flushInput() { PurgeComm(hSerial_, PURGE_RXCLEAR); }
 // ── POSIX ────────────────────────────────────────────────────────────────────
 
 inline bool SerialPort::open(const std::string & port, int baud) {
-    // ── FIX-1 : O_NONBLOCK on open() ─────────────────────────────────────────
-    // Prevents blocking on VHANGUP: if the USB-serial adapter was power-cycled
-    // while a previous fd was open, the kernel tty session may still be in a
-    // VHANGUP state. Opening with O_NONBLOCK skips the blocking wait on that
-    // stale session and returns immediately with a fresh fd.
+    // FIX-1: O_NONBLOCK on open() — avoids blocking on VHANGUP tty session
+    // left by a previous power-cycle. We clear it immediately after via fcntl
+    // so that normal VMIN/VTIME blocking reads still work.
     fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd_ < 0) {
         std::cerr << "SerialPort::open(" << port << "): " << strerror(errno) << "\n";
         return false;
     }
 
-    // ── FIX-2 : TIOCEXCL — exclusive kernel-level lock ───────────────────────
-    // Prevents udev / ModemManager / other processes from grabbing the port
-    // between our open() and tcsetattr(), which would corrupt the tty state
-    // and cause "port open but no comms" after a power-cycle.
+    // FIX-2: TIOCEXCL — exclusive kernel-level lock
     if (::ioctl(fd_, TIOCEXCL) < 0) {
-        // Non-fatal on kernels that don't support it, but warn.
         std::cerr << "SerialPort: TIOCEXCL failed (non-fatal): "
                   << strerror(errno) << "\n";
     }
 
-    // ── FIX-1 cont. : revert to blocking I/O ─────────────────────────────────
-    // VMIN/VTIME blocking model is still what we want for the framed receive
-    // loop — O_NONBLOCK was only needed for the open() call itself.
+    // FIX-1 cont.: revert to blocking I/O
     {
         const int flags = fcntl(fd_, F_GETFL, 0);
         if (flags < 0 || fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK) < 0) {
@@ -457,12 +590,7 @@ inline bool SerialPort::open(const std::string & port, int baud) {
         }
     }
 
-    // ── FIX-3 : flush BEFORE tcgetattr ───────────────────────────────────────
-    // After a CH340/CP210x power-cycle + re-enumeration, the kernel tty driver
-    // may have stale baud-rate / line-discipline state in its internal buffers.
-    // Flushing both RX and TX *before* reading the current attributes ensures
-    // tcgetattr() returns a clean baseline, and tcsetattr() actually takes
-    // effect on the hardware — not on a cached shadow register.
+    // FIX-3: flush BEFORE tcgetattr — discards stale baud/line-discipline state
     ::tcflush(fd_, TCIOFLUSH);
 
     termios tty{};
@@ -487,11 +615,8 @@ inline bool SerialPort::open(const std::string & port, int baud) {
     cfsetospeed(&tty, speed);
 
     tty.c_cflag  = (tty.c_cflag & ~CSIZE) | CS8;
-    // ── FIX-4 : clear HUPCL ──────────────────────────────────────────────────
-    // Without this, closing the fd asserts modem hangup (drops DTR/RTS).
-    // Some CH340 / CP210x adapters interpret DTR drop as a device reset,
-    // which re-enumerates the USB device and makes the /dev/ttyUSBx node
-    // disappear momentarily — exactly what triggers the lockup on re-open.
+    // FIX-4: clear HUPCL — prevents DTR/RTS drop on close() which would
+    // re-enumerate the USB adapter and cause the /dev/ttyUSBx node to vanish.
     tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS | HUPCL);
     tty.c_cflag |=  CLOCAL | CREAD;
     tty.c_iflag  = IGNPAR;
@@ -499,8 +624,7 @@ inline bool SerialPort::open(const std::string & port, int baud) {
     tty.c_lflag  = 0;
 
     // VMIN=0, VTIME=5 (500 ms): readByte() returns 0 (timeout) if no byte
-    // arrives within 500 ms, allowing receiveLoop() to re-check uart_running_
-    // without spinning on CPU.
+    // arrives within 500 ms, allowing receiveLoop() to re-check uart_running_.
     tty.c_cc[VMIN]  = 0;
     tty.c_cc[VTIME] = 5;
 
@@ -518,20 +642,11 @@ inline bool SerialPort::open(const std::string & port, int baud) {
 inline void SerialPort::close() {
     if (fd_ < 0) return;
 
-    // ── FIX-5 : clean shutdown sequence ──────────────────────────────────────
-    //
-    // Order matters:
-    //   1. tcflush — discard pending I/O so the kernel tty layer sees a clean
-    //      state; without this, some CH340 drivers hold the tty locked waiting
-    //      to drain bytes that will never be consumed.
-    //   2. TIOCNXCL — release the exclusive lock acquired in open(). If we
-    //      skip this, the SAME process's next open() call may be refused by
-    //      the kernel ("device busy") because the lock is tied to the fd, not
-    //      to the process — and closing the fd without releasing TIOCEXCL
-    //      leaves the lock in an undefined state on some kernel versions.
-    //   3. ::close(fd_) — actually releases the file descriptor.
-    //   4. fd_ = -1 — marks the object as closed; safe to call close() again.
-    //
+    // FIX-5: clean shutdown sequence
+    // 1. Flush pending I/O so the kernel tty layer sees a clean state.
+    // 2. Release TIOCEXCL so this same process can re-open the port.
+    // 3. Close the fd.
+    // 4. Mark as closed.
     ::tcflush(fd_, TCIOFLUSH);
     ::ioctl(fd_, TIOCNXCL);
     ::close(fd_);
@@ -551,17 +666,11 @@ inline int SerialPort::readByte(uint8_t & out) {
     ssize_t n;
     do {
         n = ::read(fd_, &out, 1);
-    } while (n < 0 && errno == EINTR);   // retry on signal interruption only
+    } while (n < 0 && errno == EINTR);
 
-    if (n == 1)  return  1;   // byte received
-    if (n == 0)  return  0;   // VTIME timeout — no data, caller loops
+    if (n == 1)  return  1;
+    if (n == 0)  return  0;   // VTIME timeout
 
-    // n < 0 — classify the error:
-    //   EIO     = device physically disconnected (USB power cut)
-    //   ENOTTY  = tty session invalidated (VHANGUP consumed, fd stale)
-    //   EBADF   = fd was closed under us (should not happen with FIX-7)
-    //   EAGAIN  = should not occur since O_NONBLOCK is cleared, but safe to
-    //             treat as a transient timeout
     if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
     return -1;   // EIO / ENOTTY / EBADF — caller must stop and close
 }
@@ -593,25 +702,23 @@ inline Rosmaster::Rosmaster(int car_type, const std::string & com,
     delay_ms(2);
 }
 
+// ── Destructor ────────────────────────────────────────────────────────────────
+//
+// Shutdown order (guaranteed):
+//   1. disable_pid_control()  → pid_running_=false → joins pid_thread_
+//      └─ reset_pids() called internally
+//   2. uart_running_=false    → joins recv_thread_
+//   3. ser_.close()
+//
+// pid_thread_ is joined BEFORE recv_thread_ because pidLoop() calls
+// get_motor_encoder() which reads atomics populated by receiveLoop().
+// Reversing the order would leave pidLoop() reading stale values.
 inline Rosmaster::~Rosmaster() {
-    // ── FIX-7 : guaranteed shutdown order ─────────────────────────────────────
-    //
-    // Step 1: Signal the loop to stop. The thread exits at the next VTIME
-    //         timeout (≤ 500 ms) or immediately if it already hit EIO and
-    //         called ser_.close() + set uart_running_=false itself.
+    disable_pid_control();   // always first — joins pid_thread_ internally
+
     uart_running_ = false;
+    if (recv_thread_.joinable()) recv_thread_.join();
 
-    // Step 2: Join BEFORE closing the port. This is the critical ordering.
-    //         If we closed the port first, the thread's in-flight ::read()
-    //         would return EBADF — which would be caught as a fatal error and
-    //         cause a spurious "serial error" log, and more importantly would
-    //         leave the kernel tty in an ambiguous state for the next open().
-    if (recv_thread_.joinable()) {
-        recv_thread_.join();
-    }
-
-    // Step 3: Now it is safe to close — the thread is guaranteed not to be
-    //         in ::read() anymore.
     ser_.close();
     std::cout << "Rosmaster serial closed.\n";
 }
@@ -695,6 +802,9 @@ inline void Rosmaster::parseData(uint8_t ext_type,
         encoder_m2_ = le32s(d,  4);
         encoder_m3_ = le32s(d,  8);
         encoder_m4_ = le32s(d, 12);
+        // Signal that at least one valid encoder packet has been received.
+        // enable_pid_control() waits for this flag before starting pidLoop().
+        encoder_received_.store(true, std::memory_order_release);
     }
     else if (ext_type == FUNC_UART_SERVO) {
         read_id_  = d[0];
@@ -755,73 +865,48 @@ inline void Rosmaster::parseData(uint8_t ext_type,
 
 // ── receiveLoop ───────────────────────────────────────────────────────────────
 //
-// Frame format (from Python driver):
+// Frame format:
 //   HEAD(0xFF) DEVICE_ID-1(0xFB) ext_len ext_type data[0..n-2] checksum
 //
-// Receive checksum: (ext_len + ext_type + data[0..n-3]) % 256 == data[n-2]
-// (The last byte in data[] is the checksum; it is NOT added to the sum.)
+// FIX-6: ser_.close() on fatal read errors — releases the tty session so the
+// next open() gets a clean slate after a Yahboom power-cycle.
 //
-// ── FIX-6 : ser_.close() on fatal read errors ─────────────────────────────────
-//
-// Previous version set uart_running_=false and returned on EIO, but left
-// fd_ open. The kernel tty layer then considered the port "still in use",
-// which prevented a clean re-open after Yahboom power-cycle.
-//
-// Now: on any fatal error (EIO / ENOTTY / EBADF), we call ser_.close()
-// explicitly — releasing the TIOCEXCL lock and flushing the tty — BEFORE
-// returning from the thread. The destructor's join() then completes
-// immediately, and the port is in a fully released state for the next
-// open() call (e.g. after ROS2 hardware interface re-activation).
-//
-// is_running() returning false is the external signal used by
-// MecaMateSystemHardware::reconnect_rosmaster_if_needed() to detect that
-// the Yahboom lost power and trigger a clean reconnection attempt.
+// FIX-WATCHDOG: silence watchdog (1500 ms) detects offline Yahboom without
+// requiring a GPIO signal — uart_running_ goes false so is_running() returns
+// false and reconnect_rosmaster_if_needed() can fire.
 inline void Rosmaster::receiveLoop() {
+    // Reset encoder flag at the start of every receive session.
+    // This covers the reconnection case: if the UART was lost and
+    // create_receive_threading() is called again, the flag goes back to
+    // false so enable_pid_control() correctly waits for fresh data.
+    encoder_received_.store(false, std::memory_order_release);
+
     ser_.flushInput();
 
     auto fatalExit = [&](const char * reason) {
         std::cerr << "Rosmaster[" << port_name_ << "]: " << reason
                   << " — closing port and exiting receive thread.\n";
         uart_running_ = false;
-        // FIX-6: close the fd inside the thread so the kernel tty session is
-        // fully released before the destructor's join() returns. This is safe
-        // because the destructor waits for join() before calling ser_.close()
-        // again — and SerialPort::close() is idempotent (fd_=-1 guard).
+        // FIX-6: close inside the thread so the kernel tty session is fully
+        // released before the destructor's join() returns. SerialPort::close()
+        // is idempotent (fd_=-1 guard), so the destructor calling it again
+        // after join() is safe.
         ser_.close();
     };
 
-    // ── FIX-WATCHDOG : silence watchdog ──────────────────────────────────────
-    //
-    // Problem: VTIME=5 (500 ms) means readByte() returns 0 every 500 ms when
-    // the device is gone.  Without a watchdog, receiveLoop() spins in a tight
-    // "r1==0, continue" loop forever, uart_running_ stays true, and
-    // is_running() never detects the offline condition — so
-    // reconnect_rosmaster_if_needed() never fires.
-    //
-    // Fix: track time since the last valid HEAD byte was received.  If no
-    // frame header arrives within kSilenceTimeoutMs (3× VTIME = 1500 ms),
-    // declare the link dead and exit via fatalExit() — which calls ser_.close()
-    // and sets uart_running_=false so is_running() returns false.
-    //
-    // 1500 ms is chosen deliberately:
-    //   • > 1× VTIME (500 ms) so a single timeout doesn't fire spuriously.
-    //   • = 3× VTIME so three consecutive empty reads (worst-case scheduling)
-    //     are needed before the watchdog triggers — avoids false positives on
-    //     brief bursts of silence between auto-report packets (normal operation
-    //     is ~50 Hz, i.e. a packet every 20 ms).
-    //   • Short enough that the hardware interface's 2-second reconnect
-    //     cooldown fires promptly after the Yahboom loses power.
+    // Watchdog: if no valid HEAD byte arrives for kSilenceTimeoutMs,
+    // the Yahboom is considered offline and the thread exits.
+    // 1500 ms = 3× VTIME (500 ms) — avoids false positives on brief gaps
+    // between auto-report packets (~50 Hz nominal, i.e. 20 ms apart).
     constexpr int kSilenceTimeoutMs = 1500;
     auto last_valid_head = std::chrono::steady_clock::now();
 
     while (uart_running_.load(std::memory_order_relaxed)) {
 
-        // ── Sync on frame header ─────────────────────────────────────────────
         uint8_t head1 = 0;
         const int r1 = ser_.readByte(head1);
         if (r1 < 0) { fatalExit("serial read error (EIO/ENOTTY?) on HEAD byte"); return; }
         if (r1 == 0 || head1 != HEAD) {
-            // No valid byte received — check watchdog.
             const auto now = std::chrono::steady_clock::now();
             const auto silent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - last_valid_head).count();
@@ -831,7 +916,6 @@ inline void Rosmaster::receiveLoop() {
             }
             continue;
         }
-        // Valid HEAD byte received — reset watchdog.
         last_valid_head = std::chrono::steady_clock::now();
 
         uint8_t head2 = 0;
@@ -842,7 +926,6 @@ inline void Rosmaster::receiveLoop() {
         if (ser_.readByte(ext_len)  != 1) continue;
         if (ser_.readByte(ext_type) != 1) continue;
 
-        // Receive checksum accumulates ext_len + ext_type (matches Python).
         int check_sum = ext_len + ext_type;
         const int data_len = ext_len - 2;
         if (data_len < 0) continue;
@@ -856,10 +939,10 @@ inline void Rosmaster::receiveLoop() {
             uint8_t val = 0;
             const int rn = ser_.readByte(val);
             if (rn < 0) { read_error = true; break; }
-            if (rn == 0) continue;   // VTIME timeout mid-frame — keep waiting
+            if (rn == 0) continue;
             ext_data.push_back(val);
             if (static_cast<int>(ext_data.size()) == data_len) {
-                rx_check_num = val;   // last byte IS the checksum — not accumulated
+                rx_check_num = val;   // last byte is checksum — not accumulated
             } else {
                 check_sum += val;
             }
@@ -923,6 +1006,273 @@ inline int Rosmaster::armConvertAngle(int s_id, int s_value) const {
             return static_cast<int>((180.0-0.0)*(s_value-900.0)/(3100.0-900.0)+0.0+0.5);
         default: return -1;
     }
+}
+
+// =============================================================================
+//  Software PID implementation
+// =============================================================================
+
+// ── writeMotorRaw ─────────────────────────────────────────────────────────────
+// Sends a raw motor command directly to the hardware, bypassing the PID layer.
+// Each value is clamped to [-100, 100] and packed as int8_t.
+inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
+    auto clamp_byte = [](double v) -> uint8_t {
+        return static_cast<uint8_t>(
+            static_cast<int8_t>(
+                std::clamp(static_cast<int>(std::round(v)), -100, 100)));
+    };
+    std::vector<uint8_t> raw = {
+        HEAD, DEVICE_ID, 0x00, FUNC_MOTOR,
+        clamp_byte(cmd[0]), clamp_byte(cmd[1]),
+        clamp_byte(cmd[2]), clamp_byte(cmd[3])
+    };
+    raw[2] = static_cast<uint8_t>(raw.size() - 1);
+    writeCmd(raw);
+}
+
+// ── pidLoop ───────────────────────────────────────────────────────────────────
+//
+// Per-motor control law (runs at kPidHz):
+//
+//   delta   = enc_now[i] − enc_prev[i]        (uint32 modulo 2³²)
+//   vel     = delta / dt                        (ticks/s)
+//   meas    = clamp(vel / scale × 100, −200, 200)  (%)
+//   e       = target − meas
+//   d_filt  = α·d_filt_prev + (1−α)·(e − e_prev)/dt
+//   raw_cmd = target + kp·e + ki·∫ + kd·d_filt
+//   if |raw_cmd| < 100  →  ∫ += e·dt           (pre-integration anti-windup)
+//   cmd     = clamp(raw_cmd, −100, 100)
+//
+inline void Rosmaster::pidLoop() {
+    // Seed the reference encoder from the current hardware state
+    {
+        int m1, m2, m3, m4;
+        get_motor_encoder(m1, m2, m3, m4);
+        enc_prev_pid_ = {
+            static_cast<uint32_t>(m1), static_cast<uint32_t>(m2),
+            static_cast<uint32_t>(m3), static_cast<uint32_t>(m4)
+        };
+    }
+
+    auto t_prev = std::chrono::steady_clock::now();
+
+    while (pid_running_.load(std::memory_order_relaxed)) {
+
+        // Precise sleep — avoids cumulative drift from sleep_for
+        std::this_thread::sleep_until(t_prev + kPidPeriod);
+
+        const auto   t_now = std::chrono::steady_clock::now();
+        const double dt    = std::max(
+            std::chrono::duration<double>(t_now - t_prev).count(),
+            1e-6);   // lower bound prevents division by zero
+        t_prev = t_now;
+
+        // Skip cycles where the scheduler slept far too long:
+        // a dt >> 10 ms would blow up the derivative term.
+        if (dt > 3.0 / kPidHz) continue;
+
+        // Read encoder counts
+        int m1, m2, m3, m4;
+        get_motor_encoder(m1, m2, m3, m4);
+        const std::array<uint32_t, 4> enc_now = {
+            static_cast<uint32_t>(m1), static_cast<uint32_t>(m2),
+            static_cast<uint32_t>(m3), static_cast<uint32_t>(m4)
+        };
+
+        // Copy gains under mutex — one local snapshot per cycle
+        PidGains g;
+        {
+            std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+            g = pid_gains_;
+        }
+
+        // Guard scale against zero — prevents NaN if enable_pid_control()
+        // was called with ticks_per_sec=0.0. calibrate_pid_scale() already
+        // throws on result<=0, but this covers direct API misuse.
+        const double scale = std::max(ticks_per_second_at_100pct_, 1.0);
+
+        std::array<double, 4> cmd_out{};
+
+        for (int i = 0; i < 4; ++i) {
+
+            // Δticks via uint32 modulo-2³² arithmetic.
+            // Correct through counter wrap, provided |true delta| < 2³¹.
+            // At 100 Hz with motors at max ~2500 ticks/s, delta < 25 ticks
+            // per cycle — well within the safe range.
+            const int32_t  delta    = static_cast<int32_t>(enc_now[i] - enc_prev_pid_[i]);
+            const double   velocity = static_cast<double>(delta) / dt;   // ticks/s
+
+            // Clamp measured velocity to [-200, 200]%.
+            // Corrupted UART packets can produce arbitrarily large delta values
+            // that would instantly wind up the integrator without this guard.
+            const double   measured = std::clamp(
+                (velocity / scale) * 100.0,
+                -200.0, 200.0);
+
+            const double   target   = target_[i].load(std::memory_order_relaxed);
+            const double   error    = target - measured;
+
+            // EMA-filtered derivative — suppresses encoder quantization noise
+            // (±15–20% spikes without filtering). τ_eq ≈ 40 ms at 100 Hz.
+            const double raw_deriv = (error - motor_state_[i].prev_error) / dt;
+            motor_state_[i].derivative_filtered =
+                kDerivAlpha         * motor_state_[i].derivative_filtered
+                + (1.0 - kDerivAlpha) * raw_deriv;
+            motor_state_[i].prev_error = error;
+
+            // Full output: feedforward + PID (integrator read BEFORE update)
+            const double raw_cmd =
+                target
+                + g.kp * error
+                + g.ki * motor_state_[i].integral
+                + g.kd * motor_state_[i].derivative_filtered;
+
+            // Pre-integration anti-windup:
+            // Integrator accumulates only when the full output (feedforward
+            // included) is unsaturated. No rollback needed.
+            //
+            // Tuning note: integral_limit ±80 yields a maximum integral
+            // contribution of ki × 80 = 0.4 × 80 = 32% at default gains.
+            // If the robot stalls at low setpoints (high gearbox static
+            // friction), increase this limit or raise ki during bench tuning.
+            if (std::abs(raw_cmd) < 100.0) {
+                motor_state_[i].integral += error * dt;
+                motor_state_[i].integral  = std::clamp(motor_state_[i].integral,
+                                                        -80.0, 80.0);
+            }
+            // If saturated: integrator frozen this cycle → converges without windup
+
+            cmd_out[i] = std::clamp(raw_cmd, -100.0, 100.0);
+        }
+
+        enc_prev_pid_ = enc_now;
+        writeMotorRaw(cmd_out);
+    }
+}
+
+// ── enable_pid_control ────────────────────────────────────────────────────────
+inline void Rosmaster::enable_pid_control(double kp, double ki, double kd,
+                                          double ticks_per_sec) {
+    if (!uart_running_.load(std::memory_order_acquire)) {
+        throw std::runtime_error(
+            "Rosmaster::enable_pid_control(): receive thread not running — "
+            "call create_receive_threading() first");
+    }
+    if (!encoder_received_.load(std::memory_order_acquire)) {
+        throw std::runtime_error(
+            "Rosmaster::enable_pid_control(): no encoder packet received yet — "
+            "call set_auto_report_state(true) and wait ~100 ms before enabling PID");
+    }
+
+    // Warn if calibration was skipped. The default 1326 ticks/s will almost
+    // certainly be wrong for the actual NFP-JGB37-520 gear ratio in use.
+    if (!pid_scale_calibrated_) {
+        std::cerr << "Rosmaster: WARNING — using default PID scale ("
+                  << ticks_per_sec
+                  << " ticks/s). Run calibrate_pid_scale() for accurate control.\n";
+    }
+
+    if (pid_running_.load()) return;   // idempotent
+
+    ticks_per_second_at_100pct_ = ticks_per_sec;
+
+    {
+        std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+        pid_gains_ = {kp, ki, kd};
+    }
+
+    for (auto & t : target_) t.store(0.0, std::memory_order_relaxed);
+
+    pid_enabled_.store(true,  std::memory_order_release);
+    pid_running_.store(true,  std::memory_order_release);
+    pid_thread_ = std::thread(&Rosmaster::pidLoop, this);
+
+    std::cout << "Rosmaster: PID enabled @ " << kPidHz << " Hz"
+              << "  scale=" << ticks_per_second_at_100pct_ << " ticks/s\n";
+}
+
+// ── disable_pid_control ───────────────────────────────────────────────────────
+inline void Rosmaster::disable_pid_control() {
+    if (!pid_running_.load()) return;   // idempotent
+
+    pid_running_.store(false, std::memory_order_release);
+    if (pid_thread_.joinable()) pid_thread_.join();
+    // PID thread is fully joined — reset_pids() is safe, no data race
+    pid_enabled_.store(false, std::memory_order_release);
+    reset_pids();
+
+    std::cout << "Rosmaster: PID disabled\n";
+}
+
+// ── reset_pids ────────────────────────────────────────────────────────────────
+inline void Rosmaster::reset_pids() {
+    if (pid_running_.load(std::memory_order_acquire)) {
+        std::cerr << "Rosmaster::reset_pids() ignored — PID thread is active. "
+                     "Call disable_pid_control() first.\n";
+        return;
+    }
+    for (auto & s : motor_state_) s.reset();
+    for (auto & t : target_)      t.store(0.0, std::memory_order_relaxed);
+}
+
+// ── set_pid_gains ─────────────────────────────────────────────────────────────
+inline void Rosmaster::set_pid_gains(double kp, double ki, double kd) {
+    std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+    pid_gains_ = {kp, ki, kd};
+}
+
+// ── calibrate_pid_scale ───────────────────────────────────────────────────────
+inline double Rosmaster::calibrate_pid_scale(int duration_ms) {
+    if (pid_enabled_.load()) {
+        throw std::logic_error(
+            "Rosmaster::calibrate_pid_scale(): disable PID control first");
+    }
+    if (duration_ms < 100) {
+        throw std::invalid_argument(
+            "Rosmaster::calibrate_pid_scale(): duration_ms < 100 — "
+            "too few ticks for a reliable estimate");
+    }
+
+    std::cout << "Rosmaster: calibration (" << duration_ms
+              << " ms) — ensure all wheels are free to spin\n";
+
+    int m1a, m2a, m3a, m4a;
+    get_motor_encoder(m1a, m2a, m3a, m4a);
+
+    writeMotorRaw({100.0, 100.0, 100.0, 100.0});
+    delay_ms(duration_ms);
+    writeMotorRaw({0.0, 0.0, 0.0, 0.0});
+
+    int m1b, m2b, m3b, m4b;
+    get_motor_encoder(m1b, m2b, m3b, m4b);
+
+    // uint32 modulo-2³² arithmetic — consistent with pidLoop()
+    const double dt    = duration_ms / 1000.0;
+    const int    ra[4] = {m1a, m2a, m3a, m4a};
+    const int    rb[4] = {m1b, m2b, m3b, m4b};
+    double total = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const int32_t delta = static_cast<int32_t>(
+            static_cast<uint32_t>(rb[i]) - static_cast<uint32_t>(ra[i]));
+        total += std::abs(static_cast<double>(delta));
+    }
+
+    // Guard against zero — thrown when encoders did not respond.
+    // Possible causes: UART not connected, encoder wires open,
+    // set_auto_report_state() not called, or motors stalled at 0 V.
+    const double result = (total / 4.0) / dt;
+    if (result <= 0.0) {
+        throw std::runtime_error(
+            "Rosmaster::calibrate_pid_scale(): no encoder ticks measured — "
+            "check UART connection, motor wiring, and auto-report state");
+    }
+
+    ticks_per_second_at_100pct_ = result;
+    pid_scale_calibrated_ = true;
+
+    std::cout << "Rosmaster: scale = " << ticks_per_second_at_100pct_
+              << " ticks/s (average over 4 motors)\n";
+    return ticks_per_second_at_100pct_;
 }
 
 // =============================================================================
@@ -996,7 +1346,23 @@ inline void Rosmaster::set_colorful_effect(int effect, int speed, int parm) {
     } catch (...) { std::cerr << "---set_colorful_effect error!---\n"; }
 }
 
+// ── set_motor ─────────────────────────────────────────────────────────────────
 inline void Rosmaster::set_motor(double s1, double s2, double s3, double s4) {
+    if (pid_enabled_.load(std::memory_order_acquire)) {
+        // When the PID is active, store as setpoints (clamped to [-100, 100]).
+        // Without the clamp, an out-of-range value from the ROS2 layer enters
+        // the PID as the feedforward term and completely destroys the regulator
+        // dynamics — writeMotorRaw() saturation does NOT protect this path.
+        auto clamp_target = [](double v) {
+            return std::clamp(v, -100.0, 100.0);
+        };
+        target_[0].store(clamp_target(s1), std::memory_order_relaxed);
+        target_[1].store(clamp_target(s2), std::memory_order_relaxed);
+        target_[2].store(clamp_target(s3), std::memory_order_relaxed);
+        target_[3].store(clamp_target(s4), std::memory_order_relaxed);
+        return;
+    }
+    // PID inactive: send directly to hardware (original behavior)
     try {
         auto pack = [](int8_t v) -> uint8_t { return static_cast<uint8_t>(v); };
         std::vector<uint8_t> cmd = {HEAD, DEVICE_ID, 0x00, FUNC_MOTOR,
