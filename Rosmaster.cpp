@@ -155,6 +155,7 @@ static std::array<double, 4> calibrate(Rosmaster & bot,
 // =============================================================================
 int main()
 {
+    {
     try {
         // ── 1. Ouverture port + thread réception ──────────────────────────
         Rosmaster bot(1, "/dev/ttyUSB0", 0.002, false);
@@ -202,90 +203,90 @@ int main()
         // Injecter les échelles dans le PID
         bot.set_motor_scales(final_scales, scale_global);
         // ── Mesure fréquence réelle des paquets encodeurs ─────────────────────────
-        std::cout << "\nMesure fréquence paquets encodeurs (3s)...\n";
-        {
-            int prev[4], cur[4];
-            bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
+        // std::cout << "\nMesure fréquence paquets encodeurs (3s)...\n";
+        // {
+        //     int prev[4], cur[4];
+        //     bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
 
-            int  n_changes = 0;
-            auto t_start   = std::chrono::steady_clock::now();
-            auto t_last    = t_start;
+        //     int  n_changes = 0;
+        //     auto t_start   = std::chrono::steady_clock::now();
+        //     auto t_last    = t_start;
 
-            // Robot immobile — on compte juste les changements d'encodeur
-            // (même immobile les paquets arrivent avec la même valeur → on
-            //  détecte les fronts de mise à jour via un flag dédié)
+        //     // Robot immobile — on compte juste les changements d'encodeur
+        //     // (même immobile les paquets arrivent avec la même valeur → on
+        //     //  détecte les fronts de mise à jour via un flag dédié)
 
-            // Méthode : poll à 2000 Hz, compter les transitions
-            std::vector<double> intervals_ms;
-            auto t_prev_change = t_start;
-            bool first = true;
+        //     // Méthode : poll à 2000 Hz, compter les transitions
+        //     std::vector<double> intervals_ms;
+        //     auto t_prev_change = t_start;
+        //     bool first = true;
 
-            for (int i = 0; i < 6000; ++i) {   // 6000 × 0.5 ms = 3 s
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-                bot.get_motor_encoder(cur[0], cur[1], cur[2], cur[3]);
+        //     for (int i = 0; i < 6000; ++i) {   // 6000 × 0.5 ms = 3 s
+        //         std::this_thread::sleep_for(std::chrono::microseconds(500));
+        //         bot.get_motor_encoder(cur[0], cur[1], cur[2], cur[3]);
 
-                bool changed = false;
-                for (int j = 0; j < 4; ++j)
-                    if (cur[j] != prev[j]) { changed = true; break; }
+        //         bool changed = false;
+        //         for (int j = 0; j < 4; ++j)
+        //             if (cur[j] != prev[j]) { changed = true; break; }
 
-                if (changed) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (!first) {
-                        const double ms = std::chrono::duration<double,std::milli>(
-                            now - t_prev_change).count();
-                        intervals_ms.push_back(ms);
-                    }
-                    t_prev_change = now;
-                    first = false;
-                    ++n_changes;
-                    for (int j = 0; j < 4; ++j) prev[j] = cur[j];
-                }
-            }
+        //         if (changed) {
+        //             auto now = std::chrono::steady_clock::now();
+        //             if (!first) {
+        //                 const double ms = std::chrono::duration<double,std::milli>(
+        //                     now - t_prev_change).count();
+        //                 intervals_ms.push_back(ms);
+        //             }
+        //             t_prev_change = now;
+        //             first = false;
+        //             ++n_changes;
+        //             for (int j = 0; j < 4; ++j) prev[j] = cur[j];
+        //         }
+        //     }
 
-            if (intervals_ms.size() < 5) {
-                std::cout << "  [WARN] Pas assez de changements détectés\n";
-            } else {
-                double sum = 0.0;
-                for (double v : intervals_ms) sum += v;
-                const double mean_ms = sum / intervals_ms.size();
+        //     if (intervals_ms.size() < 5) {
+        //         std::cout << "  [WARN] Pas assez de changements détectés\n";
+        //     } else {
+        //         double sum = 0.0;
+        //         for (double v : intervals_ms) sum += v;
+        //         const double mean_ms = sum / intervals_ms.size();
 
-                // Médiane
-                std::sort(intervals_ms.begin(), intervals_ms.end());
-                const double median_ms = intervals_ms[intervals_ms.size()/2];
+        //         // Médiane
+        //         std::sort(intervals_ms.begin(), intervals_ms.end());
+        //         const double median_ms = intervals_ms[intervals_ms.size()/2];
 
-                std::cout << "  Paquets détectés : " << n_changes << " en 3s\n"
-                        << "  Intervalle moyen : " << mean_ms   << " ms\n"
-                        << "  Intervalle médian: " << median_ms << " ms\n"
-                        << "  Fréquence réelle : " << 1000.0/median_ms << " Hz\n";
-            }
-        }
+        //         std::cout << "  Paquets détectés : " << n_changes << " en 3s\n"
+        //                 << "  Intervalle moyen : " << mean_ms   << " ms\n"
+        //                 << "  Intervalle médian: " << median_ms << " ms\n"
+        //                 << "  Fréquence réelle : " << 1000.0/median_ms << " Hz\n";
+        //     }
+        // }
         // ── Test stabilité encodeurs immobile (2s) ───────────────────────────────
-        std::cout << "\nTest stabilité encodeurs (robot immobile, 2s)...\n";
-        {
-            int drops[4] = {0,0,0,0};   // nombre de sauts anormaux
-            int prev[4];
-            bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
+        // std::cout << "\nTest stabilité encodeurs (robot immobile, 2s)...\n";
+        // {
+        //     int drops[4] = {0,0,0,0};   // nombre de sauts anormaux
+        //     int prev[4];
+        //     bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
 
-            for (int i = 0; i < 200; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                int cur[4];
-                bot.get_motor_encoder(cur[0], cur[1], cur[2], cur[3]);
-                for (int j = 0; j < 4; ++j) {
-                    const int32_t d = static_cast<int32_t>(
-                        static_cast<uint32_t>(cur[j]) - static_cast<uint32_t>(prev[j]));
-                    // Immobile → delta doit être 0. Toute variation = paquet corrompu.
-                    if (std::abs(d) > 5) {
-                        ++drops[j];
-                        std::cout << "  [WARN] M" << (j+1) << " saut immobile : "
-                                << d << " ticks @ " << i*10 << " ms\n";
-                    }
-                    prev[j] = cur[j];
-                }
-            }
-            for (int j = 0; j < 4; ++j)
-                std::cout << "  M" << (j+1) << " : " << drops[j]
-                        << " anomalie(s) sur 200 polls\n";
-        }
+        //     for (int i = 0; i < 200; ++i) {
+        //         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        //         int cur[4];
+        //         bot.get_motor_encoder(cur[0], cur[1], cur[2], cur[3]);
+        //         for (int j = 0; j < 4; ++j) {
+        //             const int32_t d = static_cast<int32_t>(
+        //                 static_cast<uint32_t>(cur[j]) - static_cast<uint32_t>(prev[j]));
+        //             // Immobile → delta doit être 0. Toute variation = paquet corrompu.
+        //             if (std::abs(d) > 5) {
+        //                 ++drops[j];
+        //                 std::cout << "  [WARN] M" << (j+1) << " saut immobile : "
+        //                         << d << " ticks @ " << i*10 << " ms\n";
+        //             }
+        //             prev[j] = cur[j];
+        //         }
+        //     }
+        //     for (int j = 0; j < 4; ++j)
+        //         std::cout << "  M" << (j+1) << " : " << drops[j]
+        //                 << " anomalie(s) sur 200 polls\n";
+        // }
         // ── 6bis. TEST DIAGNOSTIC — boucle ouverte, SANS PID ──────────────
         // But : déterminer si l'oscillation haute/basse observée est un
         // artefact d'aliasing entre la fenêtre d'échantillonnage (100 ms)
@@ -294,45 +295,45 @@ int main()
         // ici sur ~820 ms (≈20 périodes paquet, rapport quasi entier) :
         // si l'ondulation s'aplatit, c'était un artefact de mesure, pas
         // une vraie oscillation mécanique.
-        constexpr int kOLSampleMs = 820;   // ≈ 20 × 41 ms
-        constexpr int kOLSamples  = 6;     // 6 × 820 ms ≈ 4.9 s, comparable au test précédent
-        std::cout << "\n=== TEST BOUCLE OUVERTE (sans PID) : 40% constant, "
-                  << "fenetre " << kOLSampleMs << " ms (anti-aliasing) ===\n";
-        std::cout << "  "
-                << std::setw(7) << "t(ms)"
-                << std::setw(9) << "M1"
-                << std::setw(9) << "M2"
-                << std::setw(9) << "M3"
-                << std::setw(9) << "M4"
-                << "  (ticks/" << kOLSampleMs << "ms)"
-                << "   equiv. ticks/100ms ->\n";
-        {
-            bot.writeMotorRaw_public({80.0, 80.0, 80.0, 80.0});
+        // constexpr int kOLSampleMs = 820;   // ≈ 20 × 41 ms
+        // constexpr int kOLSamples  = 6;     // 6 × 820 ms ≈ 4.9 s, comparable au test précédent
+        // std::cout << "\n=== TEST BOUCLE OUVERTE (sans PID) : 40% constant, "
+        //           << "fenetre " << kOLSampleMs << " ms (anti-aliasing) ===\n";
+        // std::cout << "  "
+        //         << std::setw(7) << "t(ms)"
+        //         << std::setw(9) << "M1"
+        //         << std::setw(9) << "M2"
+        //         << std::setw(9) << "M3"
+        //         << std::setw(9) << "M4"
+        //         << "  (ticks/" << kOLSampleMs << "ms)"
+        //         << "   equiv. ticks/100ms ->\n";
+        // {
+        //     bot.writeMotorRaw_public({80.0, 80.0, 80.0, 80.0});
 
-            int prevOL[4] = {0, 0, 0, 0};
-            bot.get_motor_encoder(prevOL[0], prevOL[1], prevOL[2], prevOL[3]);
+        //     int prevOL[4] = {0, 0, 0, 0};
+        //     bot.get_motor_encoder(prevOL[0], prevOL[1], prevOL[2], prevOL[3]);
 
-            for (int i = 0; i < kOLSamples; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(kOLSampleMs));
-                int curOL[4];
-                bot.get_motor_encoder(curOL[0], curOL[1], curOL[2], curOL[3]);
-                std::cout << "  " << std::setw(7) << (i+1)*kOLSampleMs;
-                int32_t deltas[4];
-                for (int j = 0; j < 4; ++j) {
-                    deltas[j] = static_cast<int32_t>(
-                        static_cast<uint32_t>(curOL[j]) - static_cast<uint32_t>(prevOL[j]));
-                    std::cout << std::setw(9) << deltas[j];
-                    prevOL[j] = curOL[j];
-                }
-                std::cout << "   equiv:";
-                for (int j = 0; j < 4; ++j)
-                    std::cout << std::setw(6)
-                              << static_cast<int>(deltas[j] * 100.0 / kOLSampleMs);
-                std::cout << "\n";
-            }
-            bot.writeMotorRaw_public({0.0, 0.0, 0.0, 0.0});
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
+        //     for (int i = 0; i < kOLSamples; ++i) {
+        //         std::this_thread::sleep_for(std::chrono::milliseconds(kOLSampleMs));
+        //         int curOL[4];
+        //         bot.get_motor_encoder(curOL[0], curOL[1], curOL[2], curOL[3]);
+        //         std::cout << "  " << std::setw(7) << (i+1)*kOLSampleMs;
+        //         int32_t deltas[4];
+        //         for (int j = 0; j < 4; ++j) {
+        //             deltas[j] = static_cast<int32_t>(
+        //                 static_cast<uint32_t>(curOL[j]) - static_cast<uint32_t>(prevOL[j]));
+        //             std::cout << std::setw(9) << deltas[j];
+        //             prevOL[j] = curOL[j];
+        //         }
+        //         std::cout << "   equiv:";
+        //         for (int j = 0; j < 4; ++j)
+        //             std::cout << std::setw(6)
+        //                       << static_cast<int>(deltas[j] * 100.0 / kOLSampleMs);
+        //         std::cout << "\n";
+        //     }
+        //     bot.writeMotorRaw_public({0.0, 0.0, 0.0, 0.0});
+        //     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // }
 
         // ── 6. Activation PID ─────────────────────────────────────────────
         // CONFIRMÉ par le test boucle ouverte ci-dessus : l'oscillation
@@ -343,7 +344,8 @@ int main()
         // kp=0.6 donnait déjà un suivi correct en moyenne (léger biais
         // ~5-7% au-dessus de la cible) → ki modeste pour corriger ce
         // biais statique sans réintroduire d'instabilité.
-        bot.enable_pid_control(0.6, 0.1, 0.0, scale_global);
+        bot.enable_pid_control(4.5, 1.0, 0.0, scale_global);
+        // bot.enable_pid_control(0.6, 0.1, 0.0, scale_global);
 
         // ── 7. Test de mouvement ──────────────────────────────────────────
         // Remplacer le bloc "Test mouvement" dans main() par :
@@ -357,7 +359,7 @@ int main()
                 << std::setw(8) << "M4"
                 << "  (ticks/100ms)\n";
 
-        bot.set_motor(80.0, 80.0, 80.0, 80.0);
+        bot.set_motor(-20.0, -20.0, -20.0, -20.0);
 
         int prev[4] = {0, 0, 0, 0};
         bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
@@ -368,9 +370,9 @@ int main()
                   << "  pid%: "
                   << std::setw(7) << "M1" << std::setw(7) << "M2"
                   << std::setw(7) << "M3" << std::setw(7) << "M4"
-                  << "  tgt%\n";
+                  << "\n";
 
-        for (int i = 0; i < 50; ++i) {
+        for (int i = 0; i < 500; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             int cur[4];
@@ -387,7 +389,7 @@ int main()
             std::cout << std::fixed << std::setprecision(1) << "  pid%:";
             for (int j = 0; j < 4; ++j)
                 std::cout << std::setw(7) << meas[j];
-            std::cout << "  " << std::setw(5) << 80.0 << "\n";
+            std::cout << "\n";
         }
         // ── 8. Arrêt propre ───────────────────────────────────────────────
         bot.set_motor(0.0, 0.0, 0.0, 0.0);
@@ -398,6 +400,7 @@ int main()
     } catch (const std::exception & e) {
         std::cerr << "Erreur fatale : " << e.what() << "\n";
         return 1;
+    }
     }
     return 0;
 }
