@@ -117,6 +117,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <iomanip>
 
 // ── Platform serial abstraction ──────────────────────────────────────────────
 #ifdef _WIN32
@@ -276,6 +278,18 @@ public:
         void writeMotorRaw_public(const std::array<double,4> & cmd) {
             writeMotorRaw(cmd);
         }
+
+    // Last velocity measured by the PID loop, in % of full scale (−100..100).
+    // Written by pidLoop() at kPidHz; read by the test bench or hardware interface.
+    // Returns {0,0,0,0} when PID is disabled.
+    std::array<double, 4> get_pid_measured() const {
+        return {
+            pid_measured_[0].load(std::memory_order_relaxed),
+            pid_measured_[1].load(std::memory_order_relaxed),
+            pid_measured_[2].load(std::memory_order_relaxed),
+            pid_measured_[3].load(std::memory_order_relaxed)
+        };
+    }
 
     // Gracefully stops the PID thread, then clears all integrators.
     // Idempotent — safe to call even if PID was never started.
@@ -482,9 +496,16 @@ private:
     // Reference encoder values from the previous PID cycle — exclusive to PID thread
     std::array<uint32_t, 4> enc_prev_pid_{0u, 0u, 0u, 0u};
     // Fenêtre glissante pour la mesure de vitesse dans pidLoop()
-    // kVelWindow=4 cycles à 100 Hz = 40 ms — voir le test de fréquence
-    // réelle des paquets encodeurs avant d'ajuster cette fenêtre
-    static constexpr int kVelWindow = 4;
+    // Mesuré sur ce Pi : paquets encodeur ≈ 24.4 Hz (intervalle médian
+    // ≈ 41 ms). À kPidHz=100 (dt=10 ms), kVelWindow doit couvrir au moins
+    // 2 paquets, soit ≥ 82 ms ≥ 8 cycles — sinon la fenêtre alias avec le
+    // taux de paquets (parfois 0 paquet capté, parfois 1, ce qui fait
+    // osciller la vitesse mesurée entre ~0 et 2× la vraie valeur, et le
+    // PID amplifie ce bruit en commande). kVelWindow=10 (100 ms) laisse
+    // une marge contre le jitter du taux de paquets.
+    // Si vous changez kPidHz ou que le taux de paquets change, recalculez :
+    //   kVelWindow ≈ ceil(2 × période_paquets_ms / (1000/kPidHz))
+    static constexpr int kVelWindow = 30;
     std::array<std::array<uint32_t, 4>, kVelWindow> enc_history_{};
     int  enc_history_idx_{0};
     bool enc_history_full_{false};
@@ -521,7 +542,7 @@ private:
     // If encoders produce Δticks ≈ 0 or ±1 per cycle (slow gear ratio or
     // low encoder resolution), reduce to 50 Hz or 20 Hz for a cleaner
     // velocity estimate. Verify experimentally on your motor variant.
-    static constexpr int    kPidHz      = 100;
+    static constexpr int    kPidHz      = 25;
     static constexpr auto kPidPeriod = std::chrono::microseconds(1'000'000 / kPidHz);
 
     // pid_enabled_: atomic — read by set_motor() (ROS2 thread),
@@ -530,6 +551,10 @@ private:
 
     std::thread       pid_thread_;
     std::atomic<bool> pid_running_{false};
+
+    // Last measured velocity per motor (%), written by pidLoop(), read by get_pid_measured().
+    // Initialised to 0; reset to 0 by reset_pids().
+    std::array<std::atomic<double>, 4> pid_measured_{};
 };
 
 // =============================================================================
@@ -1153,13 +1178,24 @@ inline void Rosmaster::pidLoop() {
             const double measured = std::clamp(
                 (velocity / scale_i) * 100.0, -200.0, 200.0);
 
+            // Publish for get_pid_measured() — lock-free, relaxed is sufficient
+            pid_measured_[i].store(measured, std::memory_order_relaxed);
+
             const double target = target_[i].load(std::memory_order_relaxed);
             const double error  = target - measured;
 
             // ── Dérivée filtrée EMA ───────────────────────────────────────
-            // On utilise dt (1 cycle) pour la dérivée, pas window_dt,
-            // pour garder la réactivité du terme D sans l'étaler sur N cycles
-            const double raw_deriv = (error - motor_state_[i].prev_error) / dt;
+            // IMPORTANT : on utilise window_dt ici, pas dt.
+            // `error` dérive de `measured`, qui est lui-même une mesure
+            // moyennée sur window_dt (les paquets encodeur n'arrivent que
+            // ~tous les 41 ms, donc `measured` est en escalier sur ~4 cycles
+            // à kPidHz=100). Diviser ce saut par dt (10 ms, 1 cycle) au lieu
+            // de window_dt produit un pic de dérivée ~10× trop grand au
+            // moment de chaque nouveau paquet — c'est ce qui causait
+            // l'oscillation/saturation observée, indépendamment de la
+            // taille de kVelWindow. window_dt remet le terme D à la même
+            // échelle de temps que le signal qu'il dérive.
+            const double raw_deriv = (error - motor_state_[i].prev_error) / window_dt;
             motor_state_[i].derivative_filtered =
                 kDerivAlpha           * motor_state_[i].derivative_filtered
                 + (1.0 - kDerivAlpha) * raw_deriv;
@@ -1180,6 +1216,23 @@ inline void Rosmaster::pidLoop() {
             }
 
             cmd_out[i] = std::clamp(raw_cmd, -100.0, 100.0);
+
+            // ── Debug M1 uniquement, toutes les 5 itérations (~200 ms @ 25 Hz) ──
+            if (i == 0) {
+                static int dbg_ctr = 0;
+                if ((dbg_ctr++ % 5) == 0) {
+                    std::cout << std::fixed << std::setprecision(2)
+                              << "[PID] meas=" << measured
+                              << " tgt="       << target
+                              << " err="       << error
+                              << " int="       << motor_state_[0].integral
+                              << " cmd="       << raw_cmd
+                              << " dt="        << dt         * 1000.0 << "ms"
+                              << " wdt="       << window_dt  * 1000.0 << "ms"
+                              << " n="         << n_samples
+                              << '\n';
+                }
+            }
         }
 
         enc_prev_pid_ = enc_now;   // conservé pour calibrate_pid_scale()
@@ -1250,6 +1303,7 @@ inline void Rosmaster::reset_pids() {
     }
     for (auto & s : motor_state_) s.reset();
     for (auto & t : target_)      t.store(0.0, std::memory_order_relaxed);
+    for (auto & m : pid_measured_) m.store(0.0, std::memory_order_relaxed);
 }
 
 // ── set_pid_gains ─────────────────────────────────────────────────────────────

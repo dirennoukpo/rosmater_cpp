@@ -286,13 +286,64 @@ int main()
                 std::cout << "  M" << (j+1) << " : " << drops[j]
                         << " anomalie(s) sur 200 polls\n";
         }
+        // ── 6bis. TEST DIAGNOSTIC — boucle ouverte, SANS PID ──────────────
+        // But : déterminer si l'oscillation haute/basse observée est un
+        // artefact d'aliasing entre la fenêtre d'échantillonnage (100 ms)
+        // et la période réelle des paquets encodeur (~41 ms, 100/41≈2.44
+        // paquets/fenêtre — rapport non entier → battement). On échantillonne
+        // ici sur ~820 ms (≈20 périodes paquet, rapport quasi entier) :
+        // si l'ondulation s'aplatit, c'était un artefact de mesure, pas
+        // une vraie oscillation mécanique.
+        constexpr int kOLSampleMs = 820;   // ≈ 20 × 41 ms
+        constexpr int kOLSamples  = 6;     // 6 × 820 ms ≈ 4.9 s, comparable au test précédent
+        std::cout << "\n=== TEST BOUCLE OUVERTE (sans PID) : 40% constant, "
+                  << "fenetre " << kOLSampleMs << " ms (anti-aliasing) ===\n";
+        std::cout << "  "
+                << std::setw(7) << "t(ms)"
+                << std::setw(9) << "M1"
+                << std::setw(9) << "M2"
+                << std::setw(9) << "M3"
+                << std::setw(9) << "M4"
+                << "  (ticks/" << kOLSampleMs << "ms)"
+                << "   equiv. ticks/100ms ->\n";
+        {
+            bot.writeMotorRaw_public({40.0, 40.0, 40.0, 40.0});
+
+            int prevOL[4] = {0, 0, 0, 0};
+            bot.get_motor_encoder(prevOL[0], prevOL[1], prevOL[2], prevOL[3]);
+
+            for (int i = 0; i < kOLSamples; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kOLSampleMs));
+                int curOL[4];
+                bot.get_motor_encoder(curOL[0], curOL[1], curOL[2], curOL[3]);
+                std::cout << "  " << std::setw(7) << (i+1)*kOLSampleMs;
+                int32_t deltas[4];
+                for (int j = 0; j < 4; ++j) {
+                    deltas[j] = static_cast<int32_t>(
+                        static_cast<uint32_t>(curOL[j]) - static_cast<uint32_t>(prevOL[j]));
+                    std::cout << std::setw(9) << deltas[j];
+                    prevOL[j] = curOL[j];
+                }
+                std::cout << "   equiv:";
+                for (int j = 0; j < 4; ++j)
+                    std::cout << std::setw(6)
+                              << static_cast<int>(deltas[j] * 100.0 / kOLSampleMs);
+                std::cout << "\n";
+            }
+            bot.writeMotorRaw_public({0.0, 0.0, 0.0, 0.0});
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
         // ── 6. Activation PID ─────────────────────────────────────────────
-        // Gains originaux prévus pour 100 Hz sur Linux bare-metal — bon
-        // point de départ sur Pi. À affiner après le premier test de
-        // convergence (voir ordre de priorité : kp par pas de 0.2 si
-        // oscillation, kd à la baisse si dépassement, ki par pas de 0.05
-        // si erreur statique résiduelle).
-        bot.enable_pid_control(1.8, 0.4, 0.05, scale_global);
+        // CONFIRMÉ par le test boucle ouverte ci-dessus : l'oscillation
+
+        // est mécanique (rouleaux mecanum), pas un artefact logiciel.
+        // kd reste à 0 — différencier une perturbation physique qu'on ne
+        // peut pas annuler ne fait qu'injecter du bruit dans la commande.
+        // kp=0.6 donnait déjà un suivi correct en moyenne (léger biais
+        // ~5-7% au-dessus de la cible) → ki modeste pour corriger ce
+        // biais statique sans réintroduire d'instabilité.
+        bot.enable_pid_control(0.6, 0.1, 0.0, scale_global);
 
         // ── 7. Test de mouvement ──────────────────────────────────────────
         // Remplacer le bloc "Test mouvement" dans main() par :
@@ -311,29 +362,32 @@ int main()
         int prev[4] = {0, 0, 0, 0};
         bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
 
+        std::cout << "  " << std::setw(6) << "t(ms)"
+                  << std::setw(8) << "raw_M1" << std::setw(8) << "raw_M2"
+                  << std::setw(8) << "raw_M3" << std::setw(8) << "raw_M4"
+                  << "  pid%: "
+                  << std::setw(7) << "M1" << std::setw(7) << "M2"
+                  << std::setw(7) << "M3" << std::setw(7) << "M4"
+                  << "  tgt%\n";
+
         for (int i = 0; i < 50; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             int cur[4];
             bot.get_motor_encoder(cur[0], cur[1], cur[2], cur[3]);
+            const auto meas = bot.get_pid_measured();
 
-            // Delta ticks sur 100 ms = vitesse instantanée
-            const int dt_ms = 100;
-            std::cout << "  " << std::setw(6) << (i+1)*dt_ms;
+            std::cout << "  " << std::setw(6) << (i+1)*100;
             for (int j = 0; j < 4; ++j) {
                 const int32_t delta = static_cast<int32_t>(
                     static_cast<uint32_t>(cur[j]) - static_cast<uint32_t>(prev[j]));
                 std::cout << std::setw(8) << delta;
                 prev[j] = cur[j];
             }
-
-            // Cible théorique : scale_i × 0.40 / 10  (ticks/100ms)
-            std::cout << "  cible:"
-                    << std::setw(5) << static_cast<int>(final_scales[0]*0.40/10)
-                    << std::setw(5) << static_cast<int>(final_scales[1]*0.40/10)
-                    << std::setw(5) << static_cast<int>(final_scales[2]*0.40/10)
-                    << std::setw(5) << static_cast<int>(final_scales[3]*0.40/10)
-                    << "\n";
+            std::cout << std::fixed << std::setprecision(1) << "  pid%:";
+            for (int j = 0; j < 4; ++j)
+                std::cout << std::setw(7) << meas[j];
+            std::cout << "  " << std::setw(5) << 40.0 << "\n";
         }
         // ── 8. Arrêt propre ───────────────────────────────────────────────
         bot.set_motor(0.0, 0.0, 0.0, 0.0);
