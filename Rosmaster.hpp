@@ -1135,6 +1135,11 @@ inline void Rosmaster::pidLoop() {
         // la valeur la plus ancienne de la fenêtre (oldest).
         // Cela donne une vitesse moyennée sur kVelWindow × dt secondes,
         // ce qui élimine l'aliasing quand kPidHz > fréquence_paquets.
+        //
+        // oldest_idx = (enc_history_idx_ + 1) % kVelWindow est correct :
+        // on écrit enc_now à enc_history_idx_, puis on incrémente.
+        // Après incrément, enc_history_idx_ désigne la case écrite au
+        // tour précédent le plus ancien — pas la case qu'on vient d'écrire.
         const int oldest_idx = enc_history_full_
             ? (enc_history_idx_ + 1) % kVelWindow
             : 0;
@@ -1216,23 +1221,6 @@ inline void Rosmaster::pidLoop() {
             }
 
             cmd_out[i] = std::clamp(raw_cmd, -100.0, 100.0);
-
-            // ── Debug M1 uniquement, toutes les 5 itérations (~200 ms @ 25 Hz) ──
-            if (i == 0) {
-                static int dbg_ctr = 0;
-                if ((dbg_ctr++ % 5) == 0) {
-                    std::cout << std::fixed << std::setprecision(2)
-                              << "[PID] meas=" << measured
-                              << " tgt="       << target
-                              << " err="       << error
-                              << " int="       << motor_state_[0].integral
-                              << " cmd="       << raw_cmd
-                              << " dt="        << dt         * 1000.0 << "ms"
-                              << " wdt="       << window_dt  * 1000.0 << "ms"
-                              << " n="         << n_samples
-                              << '\n';
-                }
-            }
         }
 
         enc_prev_pid_ = enc_now;   // conservé pour calibrate_pid_scale()

@@ -307,7 +307,7 @@ int main()
                 << "  (ticks/" << kOLSampleMs << "ms)"
                 << "   equiv. ticks/100ms ->\n";
         {
-            bot.writeMotorRaw_public({40.0, 40.0, 40.0, 40.0});
+            bot.writeMotorRaw_public({80.0, 80.0, 80.0, 80.0});
 
             int prevOL[4] = {0, 0, 0, 0};
             bot.get_motor_encoder(prevOL[0], prevOL[1], prevOL[2], prevOL[3]);
@@ -357,7 +357,7 @@ int main()
                 << std::setw(8) << "M4"
                 << "  (ticks/100ms)\n";
 
-        bot.set_motor(40.0, 40.0, 40.0, 40.0);
+        bot.set_motor(80.0, 80.0, 80.0, 80.0);
 
         int prev[4] = {0, 0, 0, 0};
         bot.get_motor_encoder(prev[0], prev[1], prev[2], prev[3]);
@@ -387,7 +387,7 @@ int main()
             std::cout << std::fixed << std::setprecision(1) << "  pid%:";
             for (int j = 0; j < 4; ++j)
                 std::cout << std::setw(7) << meas[j];
-            std::cout << "  " << std::setw(5) << 40.0 << "\n";
+            std::cout << "  " << std::setw(5) << 80.0 << "\n";
         }
         // ── 8. Arrêt propre ───────────────────────────────────────────────
         bot.set_motor(0.0, 0.0, 0.0, 0.0);
