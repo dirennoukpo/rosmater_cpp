@@ -269,6 +269,14 @@ public:
                             double kd             = 0.05,
                             double ticks_per_sec  = 1326.0);
 
+                            // Injection directe des échelles après calibration externe
+        void set_motor_scales(const std::array<double,4> & scales, double global);
+
+        // Accès à writeMotorRaw depuis main() pour la calibration
+        void writeMotorRaw_public(const std::array<double,4> & cmd) {
+            writeMotorRaw(cmd);
+        }
+
     // Gracefully stops the PID thread, then clears all integrators.
     // Idempotent — safe to call even if PID was never started.
     void disable_pid_control();
@@ -289,6 +297,10 @@ public:
     //   (check UART connection, wiring, and set_auto_report_state).
     // Returns the measured ticks_per_second_at_100pct_ (average over 4 motors).
     double calibrate_pid_scale(int duration_ms = 300);
+    // Ajouter le paramètre use_per_motor
+    double calibrate_pid_scale_at(int throttle_pct  = 60,
+                                int duration_ms   = 800,
+                                bool use_per_motor = true);
 
     // ── Protocol / car-type constants ─────────────────────────────────────────
     static constexpr uint8_t FUNC_AUTO_REPORT      = 0x01;
@@ -332,6 +344,12 @@ private:
     static constexpr int     COMPLEMENT = 257 - DEVICE_ID;   // = 5
     static constexpr uint8_t CAR_ADJUST = 0x80;
     static constexpr uint8_t AKM_SERVO_ID = 0x01;
+
+
+    // Échelles individuelles par moteur (FL, FR, RL, RR)
+    // Remplies par calibrate_pid_scale_at() si use_per_motor=true
+    // Si tous à 0.0 → pidLoop() utilise ticks_per_second_at_100pct_ (global)
+    std::array<double, 4> motor_scale_{0.0, 0.0, 0.0, 0.0};
 
     // ── Internal helpers ──────────────────────────────────────────────────────
     uint8_t checksum(const std::vector<uint8_t> & cmd) const;
@@ -463,7 +481,13 @@ private:
 
     // Reference encoder values from the previous PID cycle — exclusive to PID thread
     std::array<uint32_t, 4> enc_prev_pid_{0u, 0u, 0u, 0u};
-
+    // Fenêtre glissante pour la mesure de vitesse dans pidLoop()
+    // kVelWindow=4 cycles à 100 Hz = 40 ms — voir le test de fréquence
+    // réelle des paquets encodeurs avant d'ajuster cette fenêtre
+    static constexpr int kVelWindow = 4;
+    std::array<std::array<uint32_t, 4>, kVelWindow> enc_history_{};
+    int  enc_history_idx_{0};
+    bool enc_history_full_{false};
     // Set by parseData() on the first valid FUNC_REPORT_ENCODER packet.
     // enable_pid_control() refuses to start until this flag is true:
     // uart_running_==true only means the thread is alive, not that encoder
@@ -497,7 +521,7 @@ private:
     // If encoders produce Δticks ≈ 0 or ±1 per cycle (slow gear ratio or
     // low encoder resolution), reduce to 50 Hz or 20 Hz for a cleaner
     // velocity estimate. Verify experimentally on your motor variant.
-    static constexpr int  kPidHz     = 100;
+    static constexpr int    kPidHz      = 100;
     static constexpr auto kPidPeriod = std::chrono::microseconds(1'000'000 / kPidHz);
 
     // pid_enabled_: atomic — read by set_motor() (ROS2 thread),
@@ -1044,34 +1068,36 @@ inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
 //   cmd     = clamp(raw_cmd, −100, 100)
 //
 inline void Rosmaster::pidLoop() {
-    // Seed the reference encoder from the current hardware state
+    // Seed : remplir toute la fenêtre avec la valeur initiale
     {
         int m1, m2, m3, m4;
         get_motor_encoder(m1, m2, m3, m4);
-        enc_prev_pid_ = {
+        const std::array<uint32_t, 4> seed = {
             static_cast<uint32_t>(m1), static_cast<uint32_t>(m2),
             static_cast<uint32_t>(m3), static_cast<uint32_t>(m4)
         };
+        for (auto & h : enc_history_) h = seed;
+        enc_prev_pid_     = seed;   // conservé pour compatibilité
+        enc_history_idx_  = 0;
+        enc_history_full_ = false;
     }
 
     auto t_prev = std::chrono::steady_clock::now();
 
     while (pid_running_.load(std::memory_order_relaxed)) {
 
-        // Precise sleep — avoids cumulative drift from sleep_for
         std::this_thread::sleep_until(t_prev + kPidPeriod);
 
         const auto   t_now = std::chrono::steady_clock::now();
         const double dt    = std::max(
             std::chrono::duration<double>(t_now - t_prev).count(),
-            1e-6);   // lower bound prevents division by zero
+            1e-6);
         t_prev = t_now;
 
-        // Skip cycles where the scheduler slept far too long:
-        // a dt >> 10 ms would blow up the derivative term.
+        // Skip si le scheduler a dormi bien trop longtemps
         if (dt > 3.0 / kPidHz) continue;
 
-        // Read encoder counts
+        // ── Lecture encodeurs ─────────────────────────────────────────────
         int m1, m2, m3, m4;
         get_motor_encoder(m1, m2, m3, m4);
         const std::array<uint32_t, 4> enc_now = {
@@ -1079,98 +1105,104 @@ inline void Rosmaster::pidLoop() {
             static_cast<uint32_t>(m3), static_cast<uint32_t>(m4)
         };
 
-        // Copy gains under mutex — one local snapshot per cycle
+        // ── Fenêtre glissante ─────────────────────────────────────────────
+        // On mémorise enc_now, puis on calcule le delta entre enc_now et
+        // la valeur la plus ancienne de la fenêtre (oldest).
+        // Cela donne une vitesse moyennée sur kVelWindow × dt secondes,
+        // ce qui élimine l'aliasing quand kPidHz > fréquence_paquets.
+        const int oldest_idx = enc_history_full_
+            ? (enc_history_idx_ + 1) % kVelWindow
+            : 0;
+
+        enc_history_[enc_history_idx_] = enc_now;
+        enc_history_idx_ = (enc_history_idx_ + 1) % kVelWindow;
+        if (enc_history_idx_ == 0) enc_history_full_ = true;
+
+        const int    n_samples = enc_history_full_ ? kVelWindow
+                                                   : enc_history_idx_;
+        // Durée réelle couverte par la fenêtre
+        const double window_dt = std::max(
+            static_cast<double>(n_samples) * dt, 1e-6);
+
+        // ── Gains (snapshot thread-safe) ──────────────────────────────────
         PidGains g;
         {
             std::lock_guard<std::mutex> lk(pid_gains_mutex_);
             g = pid_gains_;
         }
 
-        // Guard scale against zero — prevents NaN if enable_pid_control()
-        // was called with ticks_per_sec=0.0. calibrate_pid_scale() already
-        // throws on result<=0, but this covers direct API misuse.
-        const double scale = std::max(ticks_per_second_at_100pct_, 1.0);
+        const double scale_global = std::max(ticks_per_second_at_100pct_, 1.0);
 
         std::array<double, 4> cmd_out{};
 
         for (int i = 0; i < 4; ++i) {
 
-            // Δticks via uint32 modulo-2³² arithmetic.
-            // Correct through counter wrap, provided |true delta| < 2³¹.
-            // At 100 Hz with motors at max ~2500 ticks/s, delta < 25 ticks
-            // per cycle — well within the safe range.
-            const int32_t  delta    = static_cast<int32_t>(enc_now[i] - enc_prev_pid_[i]);
-            const double   velocity = static_cast<double>(delta) / dt;   // ticks/s
+            // ── Vitesse mesurée sur la fenêtre glissante ──────────────────
+            // uint32 modulo-2³² : correct même si le compteur wrappe,
+            // tant que |vrai delta sur window_dt| < 2³¹ ticks
+            const int32_t delta = static_cast<int32_t>(
+                enc_now[i] - enc_history_[oldest_idx][i]);
+            const double velocity = static_cast<double>(delta) / window_dt;
 
-            // Clamp measured velocity to [-200, 200]%.
-            // Corrupted UART packets can produce arbitrarily large delta values
-            // that would instantly wind up the integrator without this guard.
-            const double   measured = std::clamp(
-                (velocity / scale) * 100.0,
-                -200.0, 200.0);
+            // Garde-fou : paquet UART corrompu → delta aberrant
+            // On rejette les mesures au-delà de ±200 % de scale
+            const double scale_i = (motor_scale_[i] > 0.0)
+                ? motor_scale_[i]
+                : scale_global;
 
-            const double   target   = target_[i].load(std::memory_order_relaxed);
-            const double   error    = target - measured;
+            const double measured = std::clamp(
+                (velocity / scale_i) * 100.0, -200.0, 200.0);
 
-            // EMA-filtered derivative — suppresses encoder quantization noise
-            // (±15–20% spikes without filtering). τ_eq ≈ 40 ms at 100 Hz.
+            const double target = target_[i].load(std::memory_order_relaxed);
+            const double error  = target - measured;
+
+            // ── Dérivée filtrée EMA ───────────────────────────────────────
+            // On utilise dt (1 cycle) pour la dérivée, pas window_dt,
+            // pour garder la réactivité du terme D sans l'étaler sur N cycles
             const double raw_deriv = (error - motor_state_[i].prev_error) / dt;
             motor_state_[i].derivative_filtered =
-                kDerivAlpha         * motor_state_[i].derivative_filtered
+                kDerivAlpha           * motor_state_[i].derivative_filtered
                 + (1.0 - kDerivAlpha) * raw_deriv;
             motor_state_[i].prev_error = error;
 
-            // Full output: feedforward + PID (integrator read BEFORE update)
+            // ── Sortie PID avec feedforward ───────────────────────────────
             const double raw_cmd =
                 target
                 + g.kp * error
                 + g.ki * motor_state_[i].integral
                 + g.kd * motor_state_[i].derivative_filtered;
 
-            // Pre-integration anti-windup:
-            // Integrator accumulates only when the full output (feedforward
-            // included) is unsaturated. No rollback needed.
-            //
-            // Tuning note: integral_limit ±80 yields a maximum integral
-            // contribution of ki × 80 = 0.4 × 80 = 32% at default gains.
-            // If the robot stalls at low setpoints (high gearbox static
-            // friction), increase this limit or raise ki during bench tuning.
+            // ── Anti-windup pré-intégration ───────────────────────────────
             if (std::abs(raw_cmd) < 100.0) {
                 motor_state_[i].integral += error * dt;
-                motor_state_[i].integral  = std::clamp(motor_state_[i].integral,
-                                                        -80.0, 80.0);
+                motor_state_[i].integral  = std::clamp(
+                    motor_state_[i].integral, -80.0, 80.0);
             }
-            // If saturated: integrator frozen this cycle → converges without windup
 
             cmd_out[i] = std::clamp(raw_cmd, -100.0, 100.0);
         }
 
-        enc_prev_pid_ = enc_now;
+        enc_prev_pid_ = enc_now;   // conservé pour calibrate_pid_scale()
         writeMotorRaw(cmd_out);
     }
 }
 
 // ── enable_pid_control ────────────────────────────────────────────────────────
 inline void Rosmaster::enable_pid_control(double kp, double ki, double kd,
-                                          double ticks_per_sec) {
-    if (!uart_running_.load(std::memory_order_acquire)) {
+                                           double ticks_per_sec) {
+    if (!uart_running_.load(std::memory_order_acquire))
         throw std::runtime_error(
             "Rosmaster::enable_pid_control(): receive thread not running — "
             "call create_receive_threading() first");
-    }
-    if (!encoder_received_.load(std::memory_order_acquire)) {
+    if (!encoder_received_.load(std::memory_order_acquire))
         throw std::runtime_error(
             "Rosmaster::enable_pid_control(): no encoder packet received yet — "
             "call set_auto_report_state(true) and wait ~100 ms before enabling PID");
-    }
 
-    // Warn if calibration was skipped. The default 1326 ticks/s will almost
-    // certainly be wrong for the actual NFP-JGB37-520 gear ratio in use.
-    if (!pid_scale_calibrated_) {
+    if (!pid_scale_calibrated_)
         std::cerr << "Rosmaster: WARNING — using default PID scale ("
                   << ticks_per_sec
                   << " ticks/s). Run calibrate_pid_scale() for accurate control.\n";
-    }
 
     if (pid_running_.load()) return;   // idempotent
 
@@ -1183,11 +1215,16 @@ inline void Rosmaster::enable_pid_control(double kp, double ki, double kd,
 
     for (auto & t : target_) t.store(0.0, std::memory_order_relaxed);
 
+    // Réinitialiser la fenêtre glissante — pidLoop() la reseed au démarrage
+    enc_history_full_ = false;
+    enc_history_idx_  = 0;
+
     pid_enabled_.store(true,  std::memory_order_release);
     pid_running_.store(true,  std::memory_order_release);
     pid_thread_ = std::thread(&Rosmaster::pidLoop, this);
 
     std::cout << "Rosmaster: PID enabled @ " << kPidHz << " Hz"
+              << "  window=" << kVelWindow << " cycles"
               << "  scale=" << ticks_per_second_at_100pct_ << " ticks/s\n";
 }
 
@@ -1273,6 +1310,104 @@ inline double Rosmaster::calibrate_pid_scale(int duration_ms) {
     std::cout << "Rosmaster: scale = " << ticks_per_second_at_100pct_
               << " ticks/s (average over 4 motors)\n";
     return ticks_per_second_at_100pct_;
+}
+
+// Dans Rosmaster.hpp, nouvelle méthode à ajouter
+// Calibre à un pourcentage donné (ex: 60%) pour rester
+// dans la zone linéaire et thermiquement stable du moteur
+inline double Rosmaster::calibrate_pid_scale_at(int throttle_pct,
+                                                  int duration_ms,
+                                                  bool use_per_motor) {
+    if (pid_enabled_.load())
+        throw std::logic_error(
+            "Rosmaster::calibrate_pid_scale_at(): disable PID control first");
+    if (throttle_pct < 20 || throttle_pct > 80)
+        throw std::invalid_argument(
+            "Rosmaster::calibrate_pid_scale_at(): throttle_pct doit être dans [20, 80]");
+    if (duration_ms < 200)
+        throw std::invalid_argument(
+            "Rosmaster::calibrate_pid_scale_at(): duration_ms < 200");
+
+    const double t = static_cast<double>(throttle_pct);
+
+    std::cout << "Rosmaster: calibration @ " << throttle_pct
+              << "% pendant " << duration_ms << " ms\n";
+
+    auto stable_read = [&](int m[4]) {
+        int a[4], b[4];
+        for (int i = 0; i < 30; ++i) {
+            get_motor_encoder(a[0], a[1], a[2], a[3]);
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            get_motor_encoder(b[0], b[1], b[2], b[3]);
+            if (a[0]==b[0] && a[1]==b[1] && a[2]==b[2] && a[3]==b[3]) {
+                for (int j = 0; j < 4; ++j) m[j] = b[j];
+                return;
+            }
+        }
+        for (int j = 0; j < 4; ++j) m[j] = b[j];
+    };
+
+    int ma[4], mb[4];
+    stable_read(ma);
+
+    writeMotorRaw({t, t, t, t});
+    delay_ms(duration_ms);
+    writeMotorRaw({0.0, 0.0, 0.0, 0.0});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    stable_read(mb);
+
+    const double dt     = duration_ms / 1000.0;
+    const double ratio  = 100.0 / throttle_pct;
+    double total = 0.0;
+
+    for (int i = 0; i < 4; ++i) {
+        const int32_t delta = static_cast<int32_t>(
+            static_cast<uint32_t>(mb[i]) - static_cast<uint32_t>(ma[i]));
+        const double ticks     = std::abs(static_cast<double>(delta));
+        const double ticks_s   = ticks / dt;
+        const double scale_100 = ticks_s * ratio;
+        total += ticks;
+
+        std::cout << "  M" << (i+1)
+                  << " Δticks=" << static_cast<long>(ticks)
+                  << "  @" << throttle_pct << "%=" << ticks_s
+                  << "  @100%=" << scale_100 << " ticks/s\n";
+
+        if (use_per_motor) {
+            if (ticks_s <= 0.0)
+                throw std::runtime_error(
+                    "Rosmaster::calibrate_pid_scale_at(): M"
+                    + std::to_string(i+1) + " no ticks — check wiring");
+            motor_scale_[i] = scale_100;
+        }
+    }
+
+    const double ticks_at_throttle = (total / 4.0) / dt;
+    const double result = ticks_at_throttle * ratio;
+
+    if (result <= 0.0)
+        throw std::runtime_error(
+            "Rosmaster::calibrate_pid_scale_at(): no encoder ticks measured");
+
+    ticks_per_second_at_100pct_ = result;
+    pid_scale_calibrated_ = true;
+
+    if (use_per_motor) {
+        std::cout << "Rosmaster: échelles individuelles activées\n";
+        for (int i = 0; i < 4; ++i)
+            std::cout << "  M" << (i+1) << " = " << motor_scale_[i] << " ticks/s\n";
+    }
+
+    std::cout << "Rosmaster: scale globale@100% = " << result << " ticks/s\n";
+    return result;
+}
+
+inline void Rosmaster::set_motor_scales(const std::array<double,4> & scales,
+                                         double global) {
+    for (int i = 0; i < 4; ++i) motor_scale_[i] = scales[i];
+    ticks_per_second_at_100pct_ = global;
+    pid_scale_calibrated_ = true;
+    std::cout << "Rosmaster: motor_scale_ mis à jour\n";
 }
 
 // =============================================================================
