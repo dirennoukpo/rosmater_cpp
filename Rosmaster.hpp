@@ -148,25 +148,15 @@ public:
     SerialPort(const SerialPort &)            = delete;
     SerialPort & operator=(const SerialPort&) = delete;
 
-    // Open the port at the given baud rate.
-    // Returns true on success; leaves the object closed on failure.
     bool open(const std::string & port, int baud = 115200);
-
-    // Close the port and release the fd. Safe to call multiple times.
     void close();
-
     bool isOpen() const;
+    int  write(const std::vector<uint8_t> & data);
 
-    // Write raw bytes. Returns bytes written, or -1 on error.
-    int write(const std::vector<uint8_t> & data);
-
-    // Blocking read of exactly one byte.
-    //   Returns  1 : byte received in `out`
-    //   Returns  0 : timeout (no data within VTIME window)
-    //   Returns -1 : unrecoverable error (EIO/ENOTTY/EBADF = device gone)
-    int readByte(uint8_t & out);
-
-    // Flush (discard) the input buffer.
+    // Returns  1 : byte received
+    //          0 : timeout (VTIME window elapsed)
+    //         -1 : unrecoverable error (EIO/ENOTTY/EBADF — device gone)
+    int  readByte(uint8_t & out);
     void flushInput();
 
 private:
@@ -192,37 +182,22 @@ public:
     Rosmaster(const Rosmaster &)            = delete;
     Rosmaster & operator=(const Rosmaster&) = delete;
 
-    // ── Threading ────────────────────────────────────────────────────────────
+    // ── Threading ─────────────────────────────────────────────────────────
     void create_receive_threading();
 
-    // ── Health check ─────────────────────────────────────────────────────────
-    //
-    // Returns true if the background receive thread is alive and the serial
-    // port has not encountered a fatal error (EIO / ENOTTY / EBADF).
-    //
-    // receiveLoop() sets uart_running_=false and closes the port on any fatal
-    // read error (FIX-6). The hardware interface calls this once per read()
-    // cycle to detect a Yahboom power-cut without polling the GPIO.
-    //
-    // Thread-safe: uart_running_ is std::atomic<bool>; load() with
-    // memory_order_relaxed is sufficient — a one-cycle lag is acceptable.
+    // ── Health check ──────────────────────────────────────────────────────
     bool is_running() const {
         return uart_running_.load(std::memory_order_relaxed);
     }
 
-    // ── Car control ──────────────────────────────────────────────────────────
+    // ── Car control ───────────────────────────────────────────────────────
     void set_auto_report_state(bool enable, bool forever = false);
     void set_beep(int on_time);
     void set_pwm_servo(int servo_id, int angle);
     void set_pwm_servo_all(int angle_s1, int angle_s2, int angle_s3, int angle_s4);
     void set_colorful_lamps(int led_id, int red, int green, int blue);
     void set_colorful_effect(int effect, int speed = 255, int parm = 255);
-
-    // When the software PID is active, stores speed values as setpoints
-    // (clamped to [-100, 100]) for the PID loop. Otherwise sends directly
-    // to the hardware via FUNC_MOTOR.
     void set_motor(double speed_1, double speed_2, double speed_3, double speed_4);
-
     void set_car_run(int state, int speed, bool adjust = false);
     void set_car_motion(double v_x, double v_y, double v_z);
     void set_pid_param(double kp, double ki, double kd, bool forever = false);
@@ -241,7 +216,7 @@ public:
     void reset_car_state();
     void clear_auto_report_data();
 
-    // ── Getters ───────────────────────────────────────────────────────────────
+    // ── Getters ───────────────────────────────────────────────────────────
     void   get_accelerometer_data(double & ax, double & ay, double & az) const;
     void   get_gyroscope_data(double & gx, double & gy, double & gz) const;
     void   get_magnetometer_data(double & mx, double & my, double & mz) const;
@@ -258,97 +233,44 @@ public:
     double                   get_version();
     int                      get_car_type_from_machine();
 
-    // ── Software PID control (motor velocity loop) ────────────────────────────
-    //
-    // Enables the software PID loop running at kPidHz.
-    // Preconditions (enforced via exception):
-    //   • create_receive_threading() already called (uart_running_ == true)
-    //   • at least one encoder packet received (encoder_received_ == true)
-    //     → call set_auto_report_state(true) and wait ~100 ms before this
-    // Emits a warning to stderr if calibrate_pid_scale() was not run first.
-    void enable_pid_control(double kp             = 1.8,
-                            double ki             = 0.4,
-                            double kd             = 0.05,
-                            double ticks_per_sec  = 1326.0);
+    // ── Software PID control ──────────────────────────────────────────────
+    void   enable_pid_control(double kp            = 1.8,
+                              double ki            = 0.4,
+                              double kd            = 0.05,
+                              double ticks_per_sec = 1326.0);
+    void   disable_pid_control();
+    void   set_pid_gains(double kp, double ki, double kd);
+    void   reset_pids();
+    double calibrate_pid_scale(int duration_ms = 300);
+    double calibrate_pid_scale_at(int throttle_pct  = 60,
+                                  int duration_ms   = 800,
+                                  bool use_per_motor = true);
 
-                            // Injection directe des échelles après calibration externe
-        void set_motor_scales(const std::array<double,4> & scales, double global);
+    // Injection directe des échelles après calibration externe
+    void set_motor_scales(const std::array<double,4> & scales, double global);
 
-        // Accès à writeMotorRaw depuis main() pour la calibration
+    // Accès à writeMotorRaw depuis main() pour la calibration
     void writeMotorRaw_public(const std::array<double,4> & cmd) {
         writeMotorRaw(cmd);
     }
 
     // ── Per-motor PID gain overrides ──────────────────────────────────────
-    //
     // motor_index : 0=FL, 1=FR, 2=RL, 3=RR
-    // override=true  → ce moteur utilise les gains fournis
-    // override=false → ce moteur revient aux gains globaux (set_pid_gains)
-    //
-    // Thread-safe : protégé par pid_gains_mutex_ (même verrou que pidLoop).
     void set_motor_pid_gains(int motor_index,
                              double kp, double ki, double kd,
-                             bool override = true)
-    {
-        if (motor_index < 0 || motor_index > 3) return;
-        std::lock_guard<std::mutex> lk(pid_gains_mutex_);
-        motor_gains_[motor_index]          = {kp, ki, kd};
-        motor_gains_override_[motor_index] = override;
-    }
-
-    // Remet un moteur sur les gains globaux.
-    void reset_motor_pid_gains(int motor_index)
-    {
-        if (motor_index < 0 || motor_index > 3) return;
-        std::lock_guard<std::mutex> lk(pid_gains_mutex_);
-        motor_gains_override_[motor_index] = false;
-    }
+                             bool override = true);
+    void reset_motor_pid_gains(int motor_index);
 
     // ── Slope compensation ────────────────────────────────────────────────
     void configure_slope_compensation(bool enabled,
                                       double k_gravity,
                                       double deadband_rad,
-                                      uint64_t timeout_ns)
-    {
-        slope_comp_enabled_ = enabled;
-        k_gravity_          = k_gravity;
-        deadband_rad_       = deadband_rad;
-        pitch_timeout_ns_   = timeout_ns;
-    }
+                                      uint64_t timeout_ns);
+    void set_max_pwm_flat(double pwm);
+    void update_pitch(double pitch_rad);
+    void set_motor_with_compensation(double s1, double s2, double s3, double s4);
 
-    void set_max_pwm_flat(double pwm)
-    {
-        max_pwm_flat_ = std::clamp(pwm, 10.0, 100.0);
-    }
-
-    // Appelé par telemetry_loop() à chaque lecture IMU réussie.
-    // pitch_rad > 0 = nez vers le haut, < 0 = nez vers le bas.
-    void update_pitch(double pitch_rad)
-    {
-        pitch_rad_.store(pitch_rad, std::memory_order_relaxed);
-        const uint64_t now_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-        last_pitch_time_ns_.store(now_ns, std::memory_order_relaxed);
-    }
-
-    // Appelle set_motor() avec compensation gravitaire appliquée sur chaque roue.
-    // reserve_headroom() limite d'abord la commande à max_pwm_flat_ pour
-    // garantir une réserve de couple disponible en montée.
-    void set_motor_with_compensation(double s1, double s2,
-                                     double s3, double s4)
-    {
-        set_motor(
-            apply_slope(reserve_headroom(s1)),
-            apply_slope(reserve_headroom(s2)),
-            apply_slope(reserve_headroom(s3)),
-            apply_slope(reserve_headroom(s4)));
-    }
-
-    // Last velocity measured by the PID loop, in % of full scale (−100..100).
-    // Written by pidLoop() at kPidHz; read by the test bench or hardware interface.
-    // Returns {0,0,0,0} when PID is disabled.
+    // Last velocity measured by the PID loop (%), {0,0,0,0} when PID disabled.
     std::array<double, 4> get_pid_measured() const {
         return {
             pid_measured_[0].load(std::memory_order_relaxed),
@@ -358,32 +280,7 @@ public:
         };
     }
 
-    // Gracefully stops the PID thread, then clears all integrators.
-    // Idempotent — safe to call even if PID was never started.
-    void disable_pid_control();
-
-    // Hot-updates PID gains while the loop is running. Thread-safe.
-    void set_pid_gains(double kp, double ki, double kd);
-
-    // Clears all integrators and zeroes all setpoints.
-    // PRECONDITION: pid_running_ == false (i.e. after disable_pid_control()).
-    // For an in-flight E-stop: call set_motor(0,0,0,0) first to post a zero
-    // setpoint, then disable_pid_control(), then reset_pids() if restarting.
-    void reset_pids();
-
-    // Workshop calibration — robot lifted or area clear, PID must be disabled.
-    // Spins all four motors at 100% for duration_ms and measures encoder ticks.
-    // Throws std::invalid_argument if duration_ms < 100 (too few ticks).
-    // Throws std::runtime_error   if no encoder ticks were measured
-    //   (check UART connection, wiring, and set_auto_report_state).
-    // Returns the measured ticks_per_second_at_100pct_ (average over 4 motors).
-    double calibrate_pid_scale(int duration_ms = 300);
-    // Ajouter le paramètre use_per_motor
-    double calibrate_pid_scale_at(int throttle_pct  = 60,
-                                int duration_ms   = 800,
-                                bool use_per_motor = true);
-
-    // ── Protocol / car-type constants ─────────────────────────────────────────
+    // ── Protocol / car-type constants ─────────────────────────────────────
     static constexpr uint8_t FUNC_AUTO_REPORT      = 0x01;
     static constexpr uint8_t FUNC_BEEP             = 0x02;
     static constexpr uint8_t FUNC_PWM_SERVO        = 0x03;
@@ -419,36 +316,53 @@ public:
     static constexpr uint8_t CARTYPE_R2      = 0x05;
 
 private:
-    // ── Protocol constants ────────────────────────────────────────────────────
+    // ── Protocol constants ────────────────────────────────────────────────
     static constexpr uint8_t HEAD       = 0xFF;
     static constexpr uint8_t DEVICE_ID  = 0xFC;
     static constexpr int     COMPLEMENT = 257 - DEVICE_ID;   // = 5
     static constexpr uint8_t CAR_ADJUST = 0x80;
     static constexpr uint8_t AKM_SERVO_ID = 0x01;
 
+    // ── PID loop tuning constants ─────────────────────────────────────────
+    // α = 0.8  →  τ_eq = α/(1−α) × dt = 0.8/0.2 × (1/kPidHz) ≈ 40 ms @ 25 Hz
+    static constexpr double kDerivAlpha = 0.8;
+    static constexpr int    kPidHz      = 25;
+    static constexpr auto   kPidPeriod  = std::chrono::microseconds(1'000'000 / kPidHz);
+    // kVelWindow: sliding-window depth for velocity estimation.
+    // Encoder packets arrive at ~24.4 Hz (≈41 ms). At kPidHz=25 (dt=40 ms),
+    // kVelWindow=10 covers ~400 ms — ample averaging vs. packet jitter.
+    // Recalculate if kPidHz or packet rate changes:
+    //   kVelWindow ≈ ceil(2 × packet_period_ms / (1000/kPidHz))
+    static constexpr int    kVelWindow  = 10;
 
-    // Échelles individuelles par moteur (FL, FR, RL, RR)
-    // Remplies par calibrate_pid_scale_at() si use_per_motor=true
-    // Si tous à 0.0 → pidLoop() utilise ticks_per_second_at_100pct_ (global)
-    std::array<double, 4> motor_scale_{0.0, 0.0, 0.0, 0.0};
+    // ── Software PID — structs ────────────────────────────────────────────
+    //
+    // IMPORTANT: these structs MUST be declared before any member variable
+    // that uses them (motor_gains_, motor_state_). C++ requires types to be
+    // complete at the point of member declaration, even within the same class.
+    //
+    // PidGains      : shared between threads → protected by pid_gains_mutex_
+    // MotorPidState : exclusive to the PID thread → no mutex required
+    //
+    // Pre-integration anti-windup (standard industrial control pattern):
+    //   raw = target + kp·e + ki·∫ + kd·d_filtered
+    //   if |raw| < 100  →  ∫ += e·dt        (integration allowed)
+    //   cmd = clamp(raw, -100, 100)
+    struct PidGains {
+        double kp{1.8};
+        double ki{0.4};
+        double kd{0.05};
+    };
 
-    // ── Per-motor PID gain overrides ──────────────────────────────────────
-    // When motor_gains_override_[i] is true, motor i uses motor_gains_[i]
-    // instead of the shared pid_gains_. This allows individual tuning of
-    // motors that have different friction, inertia, or mechanical load.
-    std::array<PidGains, 4> motor_gains_{};
-    std::array<bool, 4>     motor_gains_override_{false, false, false, false};
+    struct MotorPidState {
+        double integral{0.0};
+        double prev_error{0.0};
+        double derivative_filtered{0.0};   // EMA filter on derivative term
 
-    // ── Slope compensation (gravitational feedforward) ────────────────────
-    std::atomic<double>   pitch_rad_{0.0};
-    std::atomic<uint64_t> last_pitch_time_ns_{0};
-    bool     slope_comp_enabled_{false};
-    double   k_gravity_{0.80};
-    double   deadband_rad_{0.03};
-    double   max_pwm_flat_{70.0};
-    uint64_t pitch_timeout_ns_{200'000'000ULL};
+        void reset() { integral = prev_error = derivative_filtered = 0.0; }
+    };
 
-    // ── Internal helpers ──────────────────────────────────────────────────────
+    // ── Internal helpers ──────────────────────────────────────────────────
     uint8_t checksum(const std::vector<uint8_t> & cmd) const;
     void    writeCmd(std::vector<uint8_t> & cmd);
     void    requestData(uint8_t function, uint8_t param = 0);
@@ -458,40 +372,31 @@ private:
     int     armConvertValue(int s_id, int s_angle) const;
     int     armConvertAngle(int s_id, int s_value) const;
 
-    // ── Software PID internal methods ─────────────────────────────────────────
+    // ── Software PID internal methods ─────────────────────────────────────
     void pidLoop();
     void writeMotorRaw(const std::array<double, 4> & cmd);
 
-    // ── Slope compensation helpers ─────────────────────────────────────────────
-    inline double reserve_headroom(double cmd) const
-    {
+    // ── Slope compensation helpers ─────────────────────────────────────────
+    inline double reserve_headroom(double cmd) const {
         return std::clamp(cmd, -max_pwm_flat_, max_pwm_flat_);
     }
 
-    inline double apply_slope(double cmd) const
-    {
+    inline double apply_slope(double cmd) const {
         if (!slope_comp_enabled_) return cmd;
-
-        // Timeout : pitch périmé → pas de compensation
         const uint64_t now_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-            .count());
+                std::chrono::steady_clock::now().time_since_epoch()).count());
         if (now_ns - last_pitch_time_ns_.load(std::memory_order_relaxed)
                 > pitch_timeout_ns_) {
             return cmd;
         }
-
         const double pitch = pitch_rad_.load(std::memory_order_relaxed);
         if (std::abs(pitch) < deadband_rad_) return cmd;
-
-        // Montée (pitch > 0) → factor > 1 → plus de couple
-        // Descente (pitch < 0) → factor < 1 → freinage naturel
         const double factor = 1.0 + k_gravity_ * std::sin(pitch);
         return std::clamp(cmd * factor, -100.0, 100.0);
     }
 
-    // ── Little-endian pack/unpack helpers ─────────────────────────────────────
+    // ── Little-endian pack/unpack helpers ─────────────────────────────────
     static int16_t le16s(const std::vector<uint8_t> & d, size_t off) {
         return static_cast<int16_t>(
             static_cast<uint16_t>(d[off]) |
@@ -504,9 +409,9 @@ private:
     }
     static int32_t le32s(const std::vector<uint8_t> & d, size_t off) {
         return static_cast<int32_t>(
-            static_cast<uint32_t>(d[off])             |
-            (static_cast<uint32_t>(d[off + 1]) <<  8) |
-            (static_cast<uint32_t>(d[off + 2]) << 16) |
+            static_cast<uint32_t>(d[off])              |
+            (static_cast<uint32_t>(d[off + 1]) <<  8)  |
+            (static_cast<uint32_t>(d[off + 2]) << 16)  |
             (static_cast<uint32_t>(d[off + 3]) << 24));
     }
     static std::pair<uint8_t, uint8_t> packI16(int16_t v) {
@@ -514,28 +419,24 @@ private:
                  static_cast<uint8_t>((v >> 8) & 0xff) };
     }
 
-    // ── Serial port ───────────────────────────────────────────────────────────
+    // ── Serial port ───────────────────────────────────────────────────────
     SerialPort  ser_;
     std::string port_name_;
 
-    // ── Config ────────────────────────────────────────────────────────────────
+    // ── Config ────────────────────────────────────────────────────────────
     double  delay_time_;
     bool    debug_;
     uint8_t car_type_;
 
-    // ── Background receive thread ─────────────────────────────────────────────
-    //
+    // ── Background receive thread ─────────────────────────────────────────
     // Shutdown sequence (guaranteed by destructor):
     //   1. uart_running_ = false
-    //   2. recv_thread_.join()   ← waits for the thread to exit
+    //   2. recv_thread_.join()   ← waits for thread exit
     //   3. ser_.close()          ← fd closed AFTER thread is gone
-    //
-    // uart_running_ is also the signal read by is_running() (public health
-    // check API used by MecaMateSystemHardware::reconnect_rosmaster_if_needed).
     std::thread       recv_thread_;
     std::atomic<bool> uart_running_{false};
 
-    // ── Sensor cache (std::atomic for lock-free reads from callers) ───────────
+    // ── Sensor cache (atomic for lock-free reads) ─────────────────────────
     std::atomic<double> ax_{0}, ay_{0}, az_{0};
     std::atomic<double> gx_{0}, gy_{0}, gz_{0};
     std::atomic<double> mx_{0}, my_{0}, mz_{0};
@@ -565,108 +466,65 @@ private:
 
     std::atomic<int>     read_car_type_{0};
 
-    // ── Software PID — structs ────────────────────────────────────────────────
-    //
-    // PidGains      : shared between threads → protected by pid_gains_mutex_
-    // MotorPidState : exclusive to the PID thread → no mutex required
-    //
-    // Pre-integration anti-windup (standard industrial control pattern):
-    //
-    //   raw = target + kp·e + ki·∫ + kd·d_filtered
-    //   if |raw| < 100  →  ∫ += e·dt        (integration allowed)
-    //   cmd = clamp(raw, -100, 100)
-    //
-    // The integrator is updated AFTER the saturation test on the full output
-    // (feedforward included). No post-calculation rollback — no inconsistency
-    // between integrator state and the command actually sent.
-    struct PidGains {
-        double kp{1.8};
-        double ki{0.4};
-        double kd{0.05};
-    };
-
-    struct MotorPidState {
-        double integral{0.0};
-        double prev_error{0.0};
-        double derivative_filtered{0.0};   // EMA filter to suppress quantization noise
-
-        void reset() { integral = prev_error = derivative_filtered = 0.0; }
-    };
-
-    // ── Software PID — members ────────────────────────────────────────────────
+    // ── Software PID — members ────────────────────────────────────────────
 
     // Shared gains — always accessed under pid_gains_mutex_
     mutable std::mutex pid_gains_mutex_;
     PidGains           pid_gains_{};
 
-    // Per-motor state (FL, FR, RL, RR) — exclusive to the PID thread
+    // Per-motor PID gain overrides (FL, FR, RL, RR)
+    // motor_gains_override_[i]==true  → motor i uses motor_gains_[i]
+    // motor_gains_override_[i]==false → motor i uses global pid_gains_
+    std::array<PidGains, 4> motor_gains_{};
+    std::array<bool, 4>     motor_gains_override_{false, false, false, false};
+
+    // Per-motor state — exclusive to the PID thread, no mutex needed
     std::array<MotorPidState, 4> motor_state_{};
 
-    // Setpoints deposited by set_motor(), read by pidLoop()
+    // Setpoints deposited by set_motor(), consumed by pidLoop()
     std::array<std::atomic<double>, 4> target_{};
 
-    // Reference encoder values from the previous PID cycle — exclusive to PID thread
+    // Per-motor velocity scales: ticks/s at 100% cmd.
+    // 0.0 → pidLoop() falls back to ticks_per_second_at_100pct_ (global).
+    std::array<double, 4> motor_scale_{0.0, 0.0, 0.0, 0.0};
+
+    // Reference encoder values (kept for calibrate_pid_scale compatibility)
     std::array<uint32_t, 4> enc_prev_pid_{0u, 0u, 0u, 0u};
-    // Fenêtre glissante pour la mesure de vitesse dans pidLoop()
-    // Mesuré sur ce Pi : paquets encodeur ≈ 24.4 Hz (intervalle médian
-    // ≈ 41 ms). À kPidHz=100 (dt=10 ms), kVelWindow doit couvrir au moins
-    // 2 paquets, soit ≥ 82 ms ≥ 8 cycles — sinon la fenêtre alias avec le
-    // taux de paquets (parfois 0 paquet capté, parfois 1, ce qui fait
-    // osciller la vitesse mesurée entre ~0 et 2× la vraie valeur, et le
-    // PID amplifie ce bruit en commande). kVelWindow=10 (100 ms) laisse
-    // une marge contre le jitter du taux de paquets.
-    // Si vous changez kPidHz ou que le taux de paquets change, recalculez :
-    //   kVelWindow ≈ ceil(2 × période_paquets_ms / (1000/kPidHz))
-    static constexpr int kVelWindow = 30;
+
+    // Sliding window for velocity estimation in pidLoop()
     std::array<std::array<uint32_t, 4>, kVelWindow> enc_history_{};
     int  enc_history_idx_{0};
     bool enc_history_full_{false};
-    // Set by parseData() on the first valid FUNC_REPORT_ENCODER packet.
-    // enable_pid_control() refuses to start until this flag is true:
-    // uart_running_==true only means the thread is alive, not that encoder
-    // packets have been received. Without this guard, the PID would start
-    // with velocity measurements of 0,0,0,0 and send a spurious correction.
-    //
-    // IMPORTANT: this flag is reset to false inside receiveLoop() whenever
-    // the thread restarts (i.e. on UART reconnection), so that
-    // enable_pid_control() correctly waits for fresh encoder data.
+
+    // Set by parseData() on first valid FUNC_REPORT_ENCODER packet.
+    // enable_pid_control() refuses to start until this flag is true.
+    // Reset to false by receiveLoop() on each reconnection.
     std::atomic<bool> encoder_received_{false};
 
-    // Velocity scale: ticks/s at 100% command output.
+    // Global velocity scale: ticks/s at 100% cmd.
     // Default: 1000 ticks/rev × (0.5 m/s ÷ π×0.12 m) ≈ 1326 ticks/s
-    // This is a conservative fallback — the actual value depends on the
-    // gear ratio of the NFP-JGB37-520 variant fitted to the robot.
-    // Always run calibrate_pid_scale() before field use.
     double ticks_per_second_at_100pct_{1326.0};
 
     // True once calibrate_pid_scale() has completed successfully.
-    // Used by enable_pid_control() to emit a warning if calibration was skipped.
     bool pid_scale_calibrated_{false};
 
-    // Derivative EMA filter coefficient.
-    // τ_eq = α/(1−α) × dt = 0.8/0.2 × 0.01 ≈ 40 ms at 100 Hz.
-    // If you reduce kPidHz, recalculate α to keep τ_eq ≈ 40 ms:
-    //   α = τ_eq / (τ_eq + dt)   with τ_eq = 0.04 s
-    static constexpr double kDerivAlpha = 0.8;
-
-    // PID loop frequency.
-    // 100 Hz is acceptable when Δticks per cycle is typically > 5.
-    // If encoders produce Δticks ≈ 0 or ±1 per cycle (slow gear ratio or
-    // low encoder resolution), reduce to 50 Hz or 20 Hz for a cleaner
-    // velocity estimate. Verify experimentally on your motor variant.
-    static constexpr int    kPidHz      = 25;
-    static constexpr auto kPidPeriod = std::chrono::microseconds(1'000'000 / kPidHz);
-
-    // pid_enabled_: atomic — read by set_motor() (ROS2 thread),
-    //               written by enable/disable (ROS2 thread)
+    // pid_enabled_: atomic — set_motor() reads it from the ROS2 thread
     std::atomic<bool> pid_enabled_{false};
 
     std::thread       pid_thread_;
     std::atomic<bool> pid_running_{false};
 
-    // Last measured velocity per motor (%), written by pidLoop(), read by get_pid_measured().
-    // Initialised to 0; reset to 0 by reset_pids().
+    // Last measured velocity per motor (%), written by pidLoop()
     std::array<std::atomic<double>, 4> pid_measured_{};
+
+    // ── Slope compensation ────────────────────────────────────────────────
+    std::atomic<double>   pitch_rad_{0.0};
+    std::atomic<uint64_t> last_pitch_time_ns_{0};
+    bool     slope_comp_enabled_{false};
+    double   k_gravity_{0.80};
+    double   deadband_rad_{0.03};
+    double   max_pwm_flat_{70.0};
+    uint64_t pitch_timeout_ns_{200'000'000ULL};
 };
 
 // =============================================================================
@@ -723,9 +581,9 @@ inline void SerialPort::flushInput() { PurgeComm(hSerial_, PURGE_RXCLEAR); }
 // ── POSIX ────────────────────────────────────────────────────────────────────
 
 inline bool SerialPort::open(const std::string & port, int baud) {
-    // FIX-1: O_NONBLOCK on open() — avoids blocking on VHANGUP tty session
-    // left by a previous power-cycle. We clear it immediately after via fcntl
-    // so that normal VMIN/VTIME blocking reads still work.
+    // FIX-1: O_NONBLOCK avoids blocking on VHANGUP tty session left by
+    // a previous power-cycle. Cleared immediately via fcntl so that
+    // normal VMIN/VTIME blocking reads still work.
     fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd_ < 0) {
         std::cerr << "SerialPort::open(" << port << "): " << strerror(errno) << "\n";
@@ -802,12 +660,7 @@ inline bool SerialPort::open(const std::string & port, int baud) {
 
 inline void SerialPort::close() {
     if (fd_ < 0) return;
-
-    // FIX-5: clean shutdown sequence
-    // 1. Flush pending I/O so the kernel tty layer sees a clean state.
-    // 2. Release TIOCEXCL so this same process can re-open the port.
-    // 3. Close the fd.
-    // 4. Mark as closed.
+    // FIX-5: flush → TIOCNXCL → close
     ::tcflush(fd_, TCIOFLUSH);
     ::ioctl(fd_, TIOCNXCL);
     ::close(fd_);
@@ -831,7 +684,6 @@ inline int SerialPort::readByte(uint8_t & out) {
 
     if (n == 1)  return  1;
     if (n == 0)  return  0;   // VTIME timeout
-
     if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
     return -1;   // EIO / ENOTTY / EBADF — caller must stop and close
 }
@@ -864,18 +716,14 @@ inline Rosmaster::Rosmaster(int car_type, const std::string & com,
 }
 
 // ── Destructor ────────────────────────────────────────────────────────────────
-//
-// Shutdown order (guaranteed):
+// Shutdown order:
 //   1. disable_pid_control()  → pid_running_=false → joins pid_thread_
-//      └─ reset_pids() called internally
 //   2. uart_running_=false    → joins recv_thread_
 //   3. ser_.close()
-//
-// pid_thread_ is joined BEFORE recv_thread_ because pidLoop() calls
+// pid_thread_ must be joined before recv_thread_ because pidLoop() calls
 // get_motor_encoder() which reads atomics populated by receiveLoop().
-// Reversing the order would leave pidLoop() reading stale values.
 inline Rosmaster::~Rosmaster() {
-    disable_pid_control();   // always first — joins pid_thread_ internally
+    disable_pid_control();
 
     uart_running_ = false;
     if (recv_thread_.joinable()) recv_thread_.join();
@@ -963,8 +811,6 @@ inline void Rosmaster::parseData(uint8_t ext_type,
         encoder_m2_ = le32s(d,  4);
         encoder_m3_ = le32s(d,  8);
         encoder_m4_ = le32s(d, 12);
-        // Signal that at least one valid encoder packet has been received.
-        // enable_pid_control() waits for this flag before starting pidLoop().
         encoder_received_.store(true, std::memory_order_release);
     }
     else if (ext_type == FUNC_UART_SERVO) {
@@ -1029,36 +875,20 @@ inline void Rosmaster::parseData(uint8_t ext_type,
 // Frame format:
 //   HEAD(0xFF) DEVICE_ID-1(0xFB) ext_len ext_type data[0..n-2] checksum
 //
-// FIX-6: ser_.close() on fatal read errors — releases the tty session so the
-// next open() gets a clean slate after a Yahboom power-cycle.
-//
-// FIX-WATCHDOG: silence watchdog (1500 ms) detects offline Yahboom without
-// requiring a GPIO signal — uart_running_ goes false so is_running() returns
-// false and reconnect_rosmaster_if_needed() can fire.
+// FIX-6: ser_.close() on fatal read errors.
+// FIX-WATCHDOG: 1500 ms silence → uart_running_=false.
 inline void Rosmaster::receiveLoop() {
-    // Reset encoder flag at the start of every receive session.
-    // This covers the reconnection case: if the UART was lost and
-    // create_receive_threading() is called again, the flag goes back to
-    // false so enable_pid_control() correctly waits for fresh data.
+    // Reset encoder flag on every receive session (covers reconnection).
     encoder_received_.store(false, std::memory_order_release);
-
     ser_.flushInput();
 
     auto fatalExit = [&](const char * reason) {
         std::cerr << "Rosmaster[" << port_name_ << "]: " << reason
                   << " — closing port and exiting receive thread.\n";
         uart_running_ = false;
-        // FIX-6: close inside the thread so the kernel tty session is fully
-        // released before the destructor's join() returns. SerialPort::close()
-        // is idempotent (fd_=-1 guard), so the destructor calling it again
-        // after join() is safe.
-        ser_.close();
+        ser_.close();   // FIX-6
     };
 
-    // Watchdog: if no valid HEAD byte arrives for kSilenceTimeoutMs,
-    // the Yahboom is considered offline and the thread exits.
-    // 1500 ms = 3× VTIME (500 ms) — avoids false positives on brief gaps
-    // between auto-report packets (~50 Hz nominal, i.e. 20 ms apart).
     constexpr int kSilenceTimeoutMs = 1500;
     auto last_valid_head = std::chrono::steady_clock::now();
 
@@ -1174,8 +1004,6 @@ inline int Rosmaster::armConvertAngle(int s_id, int s_value) const {
 // =============================================================================
 
 // ── writeMotorRaw ─────────────────────────────────────────────────────────────
-// Sends a raw motor command directly to the hardware, bypassing the PID layer.
-// Each value is clamped to [-100, 100] and packed as int8_t.
 inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
     auto clamp_byte = [](double v) -> uint8_t {
         return static_cast<uint8_t>(
@@ -1195,17 +1023,17 @@ inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
 //
 // Per-motor control law (runs at kPidHz):
 //
-//   delta   = enc_now[i] − enc_prev[i]        (uint32 modulo 2³²)
-//   vel     = delta / dt                        (ticks/s)
+//   delta   = enc_now[i] − oldest_enc[i]      (uint32 modulo 2³²)
+//   vel     = delta / window_dt               (ticks/s)
 //   meas    = clamp(vel / scale × 100, −200, 200)  (%)
 //   e       = target − meas
-//   d_filt  = α·d_filt_prev + (1−α)·(e − e_prev)/dt
+//   d_filt  = α·d_filt_prev + (1−α)·(e − e_prev)/window_dt
 //   raw_cmd = target + kp·e + ki·∫ + kd·d_filt
 //   if |raw_cmd| < 100  →  ∫ += e·dt           (pre-integration anti-windup)
 //   cmd     = clamp(raw_cmd, −100, 100)
 //
 inline void Rosmaster::pidLoop() {
-    // Seed : remplir toute la fenêtre avec la valeur initiale
+    // Seed sliding window with current encoder values
     {
         int m1, m2, m3, m4;
         get_motor_encoder(m1, m2, m3, m4);
@@ -1214,7 +1042,7 @@ inline void Rosmaster::pidLoop() {
             static_cast<uint32_t>(m3), static_cast<uint32_t>(m4)
         };
         for (auto & h : enc_history_) h = seed;
-        enc_prev_pid_     = seed;   // conservé pour compatibilité
+        enc_prev_pid_     = seed;
         enc_history_idx_  = 0;
         enc_history_full_ = false;
     }
@@ -1227,14 +1055,13 @@ inline void Rosmaster::pidLoop() {
 
         const auto   t_now = std::chrono::steady_clock::now();
         const double dt    = std::max(
-            std::chrono::duration<double>(t_now - t_prev).count(),
-            1e-6);
+            std::chrono::duration<double>(t_now - t_prev).count(), 1e-6);
         t_prev = t_now;
 
-        // Skip si le scheduler a dormi bien trop longtemps
+        // Skip if the scheduler overslept significantly
         if (dt > 3.0 / kPidHz) continue;
 
-        // ── Lecture encodeurs ─────────────────────────────────────────────
+        // ── Read encoders ─────────────────────────────────────────────────
         int m1, m2, m3, m4;
         get_motor_encoder(m1, m2, m3, m4);
         const std::array<uint32_t, 4> enc_now = {
@@ -1242,16 +1069,9 @@ inline void Rosmaster::pidLoop() {
             static_cast<uint32_t>(m3), static_cast<uint32_t>(m4)
         };
 
-        // ── Fenêtre glissante ─────────────────────────────────────────────
-        // On mémorise enc_now, puis on calcule le delta entre enc_now et
-        // la valeur la plus ancienne de la fenêtre (oldest).
-        // Cela donne une vitesse moyennée sur kVelWindow × dt secondes,
-        // ce qui élimine l'aliasing quand kPidHz > fréquence_paquets.
-        //
-        // oldest_idx = (enc_history_idx_ + 1) % kVelWindow est correct :
-        // on écrit enc_now à enc_history_idx_, puis on incrémente.
-        // Après incrément, enc_history_idx_ désigne la case écrite au
-        // tour précédent le plus ancien — pas la case qu'on vient d'écrire.
+        // ── Sliding window ────────────────────────────────────────────────
+        // oldest_idx points to the slot that will be overwritten next,
+        // which holds the value from kVelWindow cycles ago.
         const int oldest_idx = enc_history_full_
             ? (enc_history_idx_ + 1) % kVelWindow
             : 0;
@@ -1260,21 +1080,16 @@ inline void Rosmaster::pidLoop() {
         enc_history_idx_ = (enc_history_idx_ + 1) % kVelWindow;
         if (enc_history_idx_ == 0) enc_history_full_ = true;
 
-        const int    n_samples = enc_history_full_ ? kVelWindow
-                                                   : enc_history_idx_;
-        // Durée réelle couverte par la fenêtre
+        const int    n_samples = enc_history_full_ ? kVelWindow : enc_history_idx_;
         const double window_dt = std::max(
             static_cast<double>(n_samples) * dt, 1e-6);
 
-        // ── Gains (snapshot thread-safe, par moteur avec fallback global) ──
-        // motor_gains_override_[i] == true  → gains individuels pour le moteur i
-        // motor_gains_override_[i] == false → gains globaux pid_gains_
+        // ── Gains snapshot (per-motor with global fallback) ───────────────
         std::array<PidGains, 4> gains;
         {
             std::lock_guard<std::mutex> lk(pid_gains_mutex_);
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 4; ++i)
                 gains[i] = motor_gains_override_[i] ? motor_gains_[i] : pid_gains_;
-            }
         }
 
         const double scale_global = std::max(ticks_per_second_at_100pct_, 1.0);
@@ -1282,54 +1097,41 @@ inline void Rosmaster::pidLoop() {
         std::array<double, 4> cmd_out{};
 
         for (int i = 0; i < 4; ++i) {
-
-            // ── Vitesse mesurée sur la fenêtre glissante ──────────────────
-            // uint32 modulo-2³² : correct même si le compteur wrappe,
-            // tant que |vrai delta sur window_dt| < 2³¹ ticks
+            // ── Velocity measurement over sliding window ───────────────────
+            // uint32 modulo-2³² arithmetic — correct across counter wraparound
             const int32_t delta = static_cast<int32_t>(
                 enc_now[i] - enc_history_[oldest_idx][i]);
             const double velocity = static_cast<double>(delta) / window_dt;
 
-            // Garde-fou : paquet UART corrompu → delta aberrant
-            // On rejette les mesures au-delà de ±200 % de scale
             const double scale_i = (motor_scale_[i] > 0.0)
-                ? motor_scale_[i]
-                : scale_global;
+                ? motor_scale_[i] : scale_global;
 
             const double measured = std::clamp(
                 (velocity / scale_i) * 100.0, -200.0, 200.0);
 
-            // Publish for get_pid_measured() — lock-free, relaxed is sufficient
             pid_measured_[i].store(measured, std::memory_order_relaxed);
 
             const double target = target_[i].load(std::memory_order_relaxed);
             const double error  = target - measured;
 
-            // ── Dérivée filtrée EMA ───────────────────────────────────────
-            // IMPORTANT : on utilise window_dt ici, pas dt.
-            // `error` dérive de `measured`, qui est lui-même une mesure
-            // moyennée sur window_dt (les paquets encodeur n'arrivent que
-            // ~tous les 41 ms, donc `measured` est en escalier sur ~4 cycles
-            // à kPidHz=100). Diviser ce saut par dt (10 ms, 1 cycle) au lieu
-            // de window_dt produit un pic de dérivée ~10× trop grand au
-            // moment de chaque nouveau paquet — c'est ce qui causait
-            // l'oscillation/saturation observée, indépendamment de la
-            // taille de kVelWindow. window_dt remet le terme D à la même
-            // échelle de temps que le signal qu'il dérive.
-            const double raw_deriv = (error - motor_state_[i].prev_error) / window_dt;
+            // ── Filtered derivative (divide by window_dt, not dt) ──────────
+            // `measured` is averaged over window_dt; dividing by dt would
+            // produce a spike ~(kVelWindow)× too large on every new packet.
+            const double raw_deriv =
+                (error - motor_state_[i].prev_error) / window_dt;
             motor_state_[i].derivative_filtered =
                 kDerivAlpha           * motor_state_[i].derivative_filtered
                 + (1.0 - kDerivAlpha) * raw_deriv;
             motor_state_[i].prev_error = error;
 
-            // ── Sortie PID avec feedforward ───────────────────────────────
+            // ── PID output with feedforward ───────────────────────────────
             const double raw_cmd =
                 target
                 + gains[i].kp * error
                 + gains[i].ki * motor_state_[i].integral
                 + gains[i].kd * motor_state_[i].derivative_filtered;
 
-            // ── Anti-windup pré-intégration ───────────────────────────────
+            // ── Pre-integration anti-windup ────────────────────────────────
             if (std::abs(raw_cmd) < 100.0) {
                 motor_state_[i].integral += error * dt;
                 motor_state_[i].integral  = std::clamp(
@@ -1339,7 +1141,7 @@ inline void Rosmaster::pidLoop() {
             cmd_out[i] = std::clamp(raw_cmd, -100.0, 100.0);
         }
 
-        enc_prev_pid_ = enc_now;   // conservé pour calibrate_pid_scale()
+        enc_prev_pid_ = enc_now;
         writeMotorRaw(cmd_out);
     }
 }
@@ -1372,7 +1174,6 @@ inline void Rosmaster::enable_pid_control(double kp, double ki, double kd,
 
     for (auto & t : target_) t.store(0.0, std::memory_order_relaxed);
 
-    // Réinitialiser la fenêtre glissante — pidLoop() la reseed au démarrage
     enc_history_full_ = false;
     enc_history_idx_  = 0;
 
@@ -1391,7 +1192,6 @@ inline void Rosmaster::disable_pid_control() {
 
     pid_running_.store(false, std::memory_order_release);
     if (pid_thread_.joinable()) pid_thread_.join();
-    // PID thread is fully joined — reset_pids() is safe, no data race
     pid_enabled_.store(false, std::memory_order_release);
     reset_pids();
 
@@ -1416,17 +1216,67 @@ inline void Rosmaster::set_pid_gains(double kp, double ki, double kd) {
     pid_gains_ = {kp, ki, kd};
 }
 
+// ── set_motor_pid_gains ───────────────────────────────────────────────────────
+inline void Rosmaster::set_motor_pid_gains(int motor_index,
+                                            double kp, double ki, double kd,
+                                            bool override) {
+    if (motor_index < 0 || motor_index > 3) return;
+    std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+    motor_gains_[motor_index]          = {kp, ki, kd};
+    motor_gains_override_[motor_index] = override;
+}
+
+// ── reset_motor_pid_gains ─────────────────────────────────────────────────────
+inline void Rosmaster::reset_motor_pid_gains(int motor_index) {
+    if (motor_index < 0 || motor_index > 3) return;
+    std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+    motor_gains_override_[motor_index] = false;
+}
+
+// ── configure_slope_compensation ─────────────────────────────────────────────
+inline void Rosmaster::configure_slope_compensation(bool enabled,
+                                                     double k_gravity,
+                                                     double deadband_rad,
+                                                     uint64_t timeout_ns) {
+    slope_comp_enabled_ = enabled;
+    k_gravity_          = k_gravity;
+    deadband_rad_       = deadband_rad;
+    pitch_timeout_ns_   = timeout_ns;
+}
+
+// ── set_max_pwm_flat ──────────────────────────────────────────────────────────
+inline void Rosmaster::set_max_pwm_flat(double pwm) {
+    max_pwm_flat_ = std::clamp(pwm, 10.0, 100.0);
+}
+
+// ── update_pitch ──────────────────────────────────────────────────────────────
+inline void Rosmaster::update_pitch(double pitch_rad) {
+    pitch_rad_.store(pitch_rad, std::memory_order_relaxed);
+    const uint64_t now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    last_pitch_time_ns_.store(now_ns, std::memory_order_relaxed);
+}
+
+// ── set_motor_with_compensation ───────────────────────────────────────────────
+inline void Rosmaster::set_motor_with_compensation(double s1, double s2,
+                                                    double s3, double s4) {
+    set_motor(
+        apply_slope(reserve_headroom(s1)),
+        apply_slope(reserve_headroom(s2)),
+        apply_slope(reserve_headroom(s3)),
+        apply_slope(reserve_headroom(s4)));
+}
+
 // ── calibrate_pid_scale ───────────────────────────────────────────────────────
 inline double Rosmaster::calibrate_pid_scale(int duration_ms) {
-    if (pid_enabled_.load()) {
+    if (pid_enabled_.load())
         throw std::logic_error(
             "Rosmaster::calibrate_pid_scale(): disable PID control first");
-    }
-    if (duration_ms < 100) {
+    if (duration_ms < 100)
         throw std::invalid_argument(
             "Rosmaster::calibrate_pid_scale(): duration_ms < 100 — "
             "too few ticks for a reliable estimate");
-    }
 
     std::cout << "Rosmaster: calibration (" << duration_ms
               << " ms) — ensure all wheels are free to spin\n";
@@ -1441,7 +1291,6 @@ inline double Rosmaster::calibrate_pid_scale(int duration_ms) {
     int m1b, m2b, m3b, m4b;
     get_motor_encoder(m1b, m2b, m3b, m4b);
 
-    // uint32 modulo-2³² arithmetic — consistent with pidLoop()
     const double dt    = duration_ms / 1000.0;
     const int    ra[4] = {m1a, m2a, m3a, m4a};
     const int    rb[4] = {m1b, m2b, m3b, m4b};
@@ -1452,15 +1301,11 @@ inline double Rosmaster::calibrate_pid_scale(int duration_ms) {
         total += std::abs(static_cast<double>(delta));
     }
 
-    // Guard against zero — thrown when encoders did not respond.
-    // Possible causes: UART not connected, encoder wires open,
-    // set_auto_report_state() not called, or motors stalled at 0 V.
     const double result = (total / 4.0) / dt;
-    if (result <= 0.0) {
+    if (result <= 0.0)
         throw std::runtime_error(
             "Rosmaster::calibrate_pid_scale(): no encoder ticks measured — "
             "check UART connection, motor wiring, and auto-report state");
-    }
 
     ticks_per_second_at_100pct_ = result;
     pid_scale_calibrated_ = true;
@@ -1470,9 +1315,7 @@ inline double Rosmaster::calibrate_pid_scale(int duration_ms) {
     return ticks_per_second_at_100pct_;
 }
 
-// Dans Rosmaster.hpp, nouvelle méthode à ajouter
-// Calibre à un pourcentage donné (ex: 60%) pour rester
-// dans la zone linéaire et thermiquement stable du moteur
+// ── calibrate_pid_scale_at ────────────────────────────────────────────────────
 inline double Rosmaster::calibrate_pid_scale_at(int throttle_pct,
                                                   int duration_ms,
                                                   bool use_per_motor) {
@@ -1481,7 +1324,7 @@ inline double Rosmaster::calibrate_pid_scale_at(int throttle_pct,
             "Rosmaster::calibrate_pid_scale_at(): disable PID control first");
     if (throttle_pct < 20 || throttle_pct > 80)
         throw std::invalid_argument(
-            "Rosmaster::calibrate_pid_scale_at(): throttle_pct doit être dans [20, 80]");
+            "Rosmaster::calibrate_pid_scale_at(): throttle_pct must be in [20, 80]");
     if (duration_ms < 200)
         throw std::invalid_argument(
             "Rosmaster::calibrate_pid_scale_at(): duration_ms < 200");
@@ -1489,7 +1332,7 @@ inline double Rosmaster::calibrate_pid_scale_at(int throttle_pct,
     const double t = static_cast<double>(throttle_pct);
 
     std::cout << "Rosmaster: calibration @ " << throttle_pct
-              << "% pendant " << duration_ms << " ms\n";
+              << "% for " << duration_ms << " ms\n";
 
     auto stable_read = [&](int m[4]) {
         int a[4], b[4];
@@ -1514,8 +1357,8 @@ inline double Rosmaster::calibrate_pid_scale_at(int throttle_pct,
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     stable_read(mb);
 
-    const double dt     = duration_ms / 1000.0;
-    const double ratio  = 100.0 / throttle_pct;
+    const double dt    = duration_ms / 1000.0;
+    const double ratio = 100.0 / throttle_pct;
     double total = 0.0;
 
     for (int i = 0; i < 4; ++i) {
@@ -1551,21 +1394,21 @@ inline double Rosmaster::calibrate_pid_scale_at(int throttle_pct,
     pid_scale_calibrated_ = true;
 
     if (use_per_motor) {
-        std::cout << "Rosmaster: échelles individuelles activées\n";
+        std::cout << "Rosmaster: per-motor scales enabled\n";
         for (int i = 0; i < 4; ++i)
             std::cout << "  M" << (i+1) << " = " << motor_scale_[i] << " ticks/s\n";
     }
-
-    std::cout << "Rosmaster: scale globale@100% = " << result << " ticks/s\n";
+    std::cout << "Rosmaster: global scale@100% = " << result << " ticks/s\n";
     return result;
 }
 
+// ── set_motor_scales ──────────────────────────────────────────────────────────
 inline void Rosmaster::set_motor_scales(const std::array<double,4> & scales,
                                          double global) {
     for (int i = 0; i < 4; ++i) motor_scale_[i] = scales[i];
     ticks_per_second_at_100pct_ = global;
     pid_scale_calibrated_ = true;
-    std::cout << "Rosmaster: motor_scale_ mis à jour\n";
+    std::cout << "Rosmaster: motor_scale_ updated\n";
 }
 
 // =============================================================================
@@ -1642,20 +1485,13 @@ inline void Rosmaster::set_colorful_effect(int effect, int speed, int parm) {
 // ── set_motor ─────────────────────────────────────────────────────────────────
 inline void Rosmaster::set_motor(double s1, double s2, double s3, double s4) {
     if (pid_enabled_.load(std::memory_order_acquire)) {
-        // When the PID is active, store as setpoints (clamped to [-100, 100]).
-        // Without the clamp, an out-of-range value from the ROS2 layer enters
-        // the PID as the feedforward term and completely destroys the regulator
-        // dynamics — writeMotorRaw() saturation does NOT protect this path.
-        auto clamp_target = [](double v) {
-            return std::clamp(v, -100.0, 100.0);
-        };
+        auto clamp_target = [](double v) { return std::clamp(v, -100.0, 100.0); };
         target_[0].store(clamp_target(s1), std::memory_order_relaxed);
         target_[1].store(clamp_target(s2), std::memory_order_relaxed);
         target_[2].store(clamp_target(s3), std::memory_order_relaxed);
         target_[3].store(clamp_target(s4), std::memory_order_relaxed);
         return;
     }
-    // PID inactive: send directly to hardware (original behavior)
     try {
         auto pack = [](int8_t v) -> uint8_t { return static_cast<uint8_t>(v); };
         std::vector<uint8_t> cmd = {HEAD, DEVICE_ID, 0x00, FUNC_MOTOR,
@@ -1936,9 +1772,9 @@ inline std::pair<int,int> Rosmaster::get_uart_servo_value(int servo_id) {
 inline int Rosmaster::get_uart_servo_angle(int s_id) {
     try {
         auto [rid, value] = get_uart_servo_value(s_id);
-        const int max_a = (s_id == 5) ? 270 : 180;
         if (s_id >= 1 && s_id <= 6 && rid == s_id) {
             const int angle = armConvertAngle(s_id, value);
+            const int max_a = (s_id == 5) ? 270 : 180;
             if (angle < 0 || angle > max_a) return -1;
             return angle;
         }
