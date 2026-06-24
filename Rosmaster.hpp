@@ -275,9 +275,76 @@ public:
         void set_motor_scales(const std::array<double,4> & scales, double global);
 
         // Accès à writeMotorRaw depuis main() pour la calibration
-        void writeMotorRaw_public(const std::array<double,4> & cmd) {
-            writeMotorRaw(cmd);
-        }
+    void writeMotorRaw_public(const std::array<double,4> & cmd) {
+        writeMotorRaw(cmd);
+    }
+
+    // ── Per-motor PID gain overrides ──────────────────────────────────────
+    //
+    // motor_index : 0=FL, 1=FR, 2=RL, 3=RR
+    // override=true  → ce moteur utilise les gains fournis
+    // override=false → ce moteur revient aux gains globaux (set_pid_gains)
+    //
+    // Thread-safe : protégé par pid_gains_mutex_ (même verrou que pidLoop).
+    void set_motor_pid_gains(int motor_index,
+                             double kp, double ki, double kd,
+                             bool override = true)
+    {
+        if (motor_index < 0 || motor_index > 3) return;
+        std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+        motor_gains_[motor_index]          = {kp, ki, kd};
+        motor_gains_override_[motor_index] = override;
+    }
+
+    // Remet un moteur sur les gains globaux.
+    void reset_motor_pid_gains(int motor_index)
+    {
+        if (motor_index < 0 || motor_index > 3) return;
+        std::lock_guard<std::mutex> lk(pid_gains_mutex_);
+        motor_gains_override_[motor_index] = false;
+    }
+
+    // ── Slope compensation ────────────────────────────────────────────────
+    void configure_slope_compensation(bool enabled,
+                                      double k_gravity,
+                                      double deadband_rad,
+                                      uint64_t timeout_ns)
+    {
+        slope_comp_enabled_ = enabled;
+        k_gravity_          = k_gravity;
+        deadband_rad_       = deadband_rad;
+        pitch_timeout_ns_   = timeout_ns;
+    }
+
+    void set_max_pwm_flat(double pwm)
+    {
+        max_pwm_flat_ = std::clamp(pwm, 10.0, 100.0);
+    }
+
+    // Appelé par telemetry_loop() à chaque lecture IMU réussie.
+    // pitch_rad > 0 = nez vers le haut, < 0 = nez vers le bas.
+    void update_pitch(double pitch_rad)
+    {
+        pitch_rad_.store(pitch_rad, std::memory_order_relaxed);
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+        last_pitch_time_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+
+    // Appelle set_motor() avec compensation gravitaire appliquée sur chaque roue.
+    // reserve_headroom() limite d'abord la commande à max_pwm_flat_ pour
+    // garantir une réserve de couple disponible en montée.
+    void set_motor_with_compensation(double s1, double s2,
+                                     double s3, double s4)
+    {
+        set_motor(
+            apply_slope(reserve_headroom(s1)),
+            apply_slope(reserve_headroom(s2)),
+            apply_slope(reserve_headroom(s3)),
+            apply_slope(reserve_headroom(s4)));
+    }
 
     // Last velocity measured by the PID loop, in % of full scale (−100..100).
     // Written by pidLoop() at kPidHz; read by the test bench or hardware interface.
@@ -365,6 +432,22 @@ private:
     // Si tous à 0.0 → pidLoop() utilise ticks_per_second_at_100pct_ (global)
     std::array<double, 4> motor_scale_{0.0, 0.0, 0.0, 0.0};
 
+    // ── Per-motor PID gain overrides ──────────────────────────────────────
+    // When motor_gains_override_[i] is true, motor i uses motor_gains_[i]
+    // instead of the shared pid_gains_. This allows individual tuning of
+    // motors that have different friction, inertia, or mechanical load.
+    std::array<PidGains, 4> motor_gains_{};
+    std::array<bool, 4>     motor_gains_override_{false, false, false, false};
+
+    // ── Slope compensation (gravitational feedforward) ────────────────────
+    std::atomic<double>   pitch_rad_{0.0};
+    std::atomic<uint64_t> last_pitch_time_ns_{0};
+    bool     slope_comp_enabled_{false};
+    double   k_gravity_{0.80};
+    double   deadband_rad_{0.03};
+    double   max_pwm_flat_{70.0};
+    uint64_t pitch_timeout_ns_{200'000'000ULL};
+
     // ── Internal helpers ──────────────────────────────────────────────────────
     uint8_t checksum(const std::vector<uint8_t> & cmd) const;
     void    writeCmd(std::vector<uint8_t> & cmd);
@@ -378,6 +461,35 @@ private:
     // ── Software PID internal methods ─────────────────────────────────────────
     void pidLoop();
     void writeMotorRaw(const std::array<double, 4> & cmd);
+
+    // ── Slope compensation helpers ─────────────────────────────────────────────
+    inline double reserve_headroom(double cmd) const
+    {
+        return std::clamp(cmd, -max_pwm_flat_, max_pwm_flat_);
+    }
+
+    inline double apply_slope(double cmd) const
+    {
+        if (!slope_comp_enabled_) return cmd;
+
+        // Timeout : pitch périmé → pas de compensation
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+        if (now_ns - last_pitch_time_ns_.load(std::memory_order_relaxed)
+                > pitch_timeout_ns_) {
+            return cmd;
+        }
+
+        const double pitch = pitch_rad_.load(std::memory_order_relaxed);
+        if (std::abs(pitch) < deadband_rad_) return cmd;
+
+        // Montée (pitch > 0) → factor > 1 → plus de couple
+        // Descente (pitch < 0) → factor < 1 → freinage naturel
+        const double factor = 1.0 + k_gravity_ * std::sin(pitch);
+        return std::clamp(cmd * factor, -100.0, 100.0);
+    }
 
     // ── Little-endian pack/unpack helpers ─────────────────────────────────────
     static int16_t le16s(const std::vector<uint8_t> & d, size_t off) {
@@ -1154,11 +1266,15 @@ inline void Rosmaster::pidLoop() {
         const double window_dt = std::max(
             static_cast<double>(n_samples) * dt, 1e-6);
 
-        // ── Gains (snapshot thread-safe) ──────────────────────────────────
-        PidGains g;
+        // ── Gains (snapshot thread-safe, par moteur avec fallback global) ──
+        // motor_gains_override_[i] == true  → gains individuels pour le moteur i
+        // motor_gains_override_[i] == false → gains globaux pid_gains_
+        std::array<PidGains, 4> gains;
         {
             std::lock_guard<std::mutex> lk(pid_gains_mutex_);
-            g = pid_gains_;
+            for (int i = 0; i < 4; ++i) {
+                gains[i] = motor_gains_override_[i] ? motor_gains_[i] : pid_gains_;
+            }
         }
 
         const double scale_global = std::max(ticks_per_second_at_100pct_, 1.0);
@@ -1209,9 +1325,9 @@ inline void Rosmaster::pidLoop() {
             // ── Sortie PID avec feedforward ───────────────────────────────
             const double raw_cmd =
                 target
-                + g.kp * error
-                + g.ki * motor_state_[i].integral
-                + g.kd * motor_state_[i].derivative_filtered;
+                + gains[i].kp * error
+                + gains[i].ki * motor_state_[i].integral
+                + gains[i].kd * motor_state_[i].derivative_filtered;
 
             // ── Anti-windup pré-intégration ───────────────────────────────
             if (std::abs(raw_cmd) < 100.0) {
