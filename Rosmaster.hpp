@@ -117,6 +117,17 @@
 //             calibrate_pid_scale_at() is kept as a single-run compatibility
 //             wrapper that delegates to calibrate_motor_scales(n_runs=1).
 //             [NOTE]  kVelWindow=10 (≈400 ms window) confirmed by bench log.
+//  v6 → v7 : [FIXED] Direction-reversal instability ("zailling") — three bugs:
+//             (1) D term now computed on EMA of error (not measured), so its
+//             sign is correct in both rotation directions and helps accelerate
+//             toward a new setpoint instead of opposing it.
+//             (2) Anti-windup extended: integration is also allowed when
+//             sign(error) ≠ sign(integral) (integral winding DOWN), so the
+//             integrator can discharge during reversal even while saturated.
+//             Without this, the integrator stays charged in the old direction
+//             and fights the new command for hundreds of milliseconds.
+//             (3) MotorPidState gains error_filtered field; prev_meas_filtered
+//             renamed prev_meas_filtered for clarity.
 
 #include <array>
 #include <atomic>
@@ -375,13 +386,14 @@ private:
     // PidGains      : shared between threads → protected by pid_gains_mutex_
     // MotorPidState : exclusive to the PID thread → no mutex required
     //
-    // Control law (v6):
-    //   measured[i]  = clamp(delta_ticks / window_dt / scale × 100, -200, 200)
-    //   meas_filt[i] = α·meas_filt_prev + (1−α)·measured     ← EMA on signal
-    //   error        = target − measured
-    //   d_term       = kd · (meas_filt − meas_filt_prev) / dt  ← correct divisor
-    //   raw_cmd      = target + kp·e + ki·∫ − d_term           ← note: minus D
-    //   if |raw_cmd| < 100 → ∫ += e·dt  (pre-integration anti-windup)
+    // Control law (v7 — sign-correct for both directions):
+    //   measured[i]  = signed(delta_ticks) / window_dt / scale × 100   [%]
+    //   meas_filt[i] = α·meas_filt_prev + (1−α)·measured               [EMA signal]
+    //   error        = target − measured                                 [signed]
+    //   err_filt[i]  = α·err_filt_prev  + (1−α)·error                  [EMA error]
+    //   d_term       = kd · (err_filt − err_filt_prev) / dt             [+: error grows → push]
+    //   raw_cmd      = target + kp·error + ki·∫ + d_term
+    //   anti-windup  : integrate if |raw_cmd|<100 OR sign(error)≠sign(∫) [allow wind-down]
     //   cmd          = clamp(raw_cmd, −100, 100)
     struct PidGains {
         double kp{1.8};
@@ -391,10 +403,12 @@ private:
 
     struct MotorPidState {
         double integral{0.0};
-        double prev_error{0.0};
-        double measured_filtered{0.0};  // EMA on measured velocity (for D term)
+        double measured_filtered{0.0};   // EMA on measured velocity (for display)
+        double error_filtered{0.0};      // EMA on error (for D term — sign-correct)
 
-        void reset() { integral = prev_error = measured_filtered = 0.0; }
+        void reset() {
+            integral = measured_filtered = error_filtered = 0.0;
+        }
     };
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -1064,25 +1078,33 @@ inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
 
 // ── pidLoop ───────────────────────────────────────────────────────────────────
 //
-// Per-motor control law (v6, runs at kPidHz):
+// Per-motor control law (v7 — sign-correct in both rotation directions):
 //
-//  Velocity measurement (timestamp-based window):
-//   slot      = { enc[4], ts_us }  stored at every PID iteration
-//   delta[i]  = enc_now[i] − oldest_slot.enc[i]    (uint32 modulo 2³²)
-//   window_dt = (ts_now − oldest_slot.ts_us) / 1e6  [real seconds]
-//   velocity  = delta[i] / window_dt               [ticks/s]
-//   measured  = clamp(velocity / scale × 100, −200, 200)   [%]
+//  Velocity measurement (timestamp-based window, signed):
+//   delta[i]  = int32(enc_now[i] − oldest_slot.enc[i])   (signed modulo-2³²)
+//   window_dt = (ts_now − oldest_slot.ts_us) / 1e6        [real seconds]
+//   velocity  = delta[i] / window_dt                      [ticks/s, signed]
+//   measured  = clamp(velocity / scale × 100, −200, 200)  [%, signed]
 //
-//  EMA on measured (for derivative — avoids dividing noise by dt):
+//  EMA on measured (for display / feedforward quality):
 //   meas_filt = α·meas_filt_prev + (1−α)·measured
 //
+//  EMA on error (for D term — preserves sign across direction reversal):
+//   error      = target − measured                         [signed]
+//   err_filt   = α·err_filt_prev + (1−α)·error
+//   d_term     = kd · (err_filt − err_filt_prev) / dt
+//     → positive when error is growing (motor lagging)  → pushes harder
+//     → negative when error is shrinking (motor catching up) → backs off
+//     → sign is consistent regardless of rotation direction
+//
 //  PID output:
-//   error    = target − measured
-//   d_term   = kd · (meas_filt − meas_filt_prev) / dt     ← real dt, not window_dt
-//   raw_cmd  = target + kp·error + ki·integral − d_term   ← note minus on D
-//   if |raw_cmd| < 100 → integral += error·dt             ← pre-integration AW
-//   integral = clamp(integral, −80, 80)
-//   cmd      = clamp(raw_cmd, −100, 100)
+//   raw_cmd = target + kp·error + ki·integral + d_term
+//
+//  Anti-windup (improved):
+//   Integrate if |raw_cmd| < 100  (not saturated)
+//   OR if sign(error) ≠ sign(integral)  (integral winding DOWN — always allow)
+//   This lets the integrator discharge during direction reversal even when
+//   saturated, preventing the stuck-integral bug at inversion.
 //
 inline void Rosmaster::pidLoop() {
     using Clock = std::chrono::steady_clock;
@@ -1129,9 +1151,6 @@ inline void Rosmaster::pidLoop() {
         };
 
         // ── Update ring buffer ────────────────────────────────────────────
-        // oldest_idx: slot that holds data from kVelWindow iterations ago.
-        // Before first wrap: oldest_idx=0 (seed slot, correct for growing window).
-        // After wrap: oldest_idx = (enc_history_idx_+1) % kVelWindow.
         const int oldest_idx = enc_history_full_
             ? (enc_history_idx_ + 1) % kVelWindow
             : 0;
@@ -1141,9 +1160,6 @@ inline void Rosmaster::pidLoop() {
         if (enc_history_idx_ == 0) enc_history_full_ = true;
 
         // ── Real window_dt from timestamps ────────────────────────────────
-        // oldest_slot.ts_us is the wall-clock time of the oldest sample.
-        // This captures the real encoder packet rate (24.4 Hz) independent
-        // of the PID scheduler period, eliminating the systematic bias.
         const int64_t ts_oldest_us = enc_history_[oldest_idx].ts_us;
         const double  window_dt    = std::max(
             static_cast<double>(ts_now_us - ts_oldest_us) * 1e-6, 1e-6);
@@ -1161,7 +1177,9 @@ inline void Rosmaster::pidLoop() {
         std::array<double, 4> cmd_out{};
 
         for (int i = 0; i < 4; ++i) {
-            // ── Velocity over real timestamp window ───────────────────────
+            // ── Signed velocity over real timestamp window ─────────────────
+            // int32 cast of uint32 subtraction → signed delta, correct across
+            // counter wraparound in both rotation directions.
             const int32_t delta = static_cast<int32_t>(
                 enc_now[i] - enc_history_[oldest_idx].enc[i]);
             const double velocity = static_cast<double>(delta) / window_dt;
@@ -1169,12 +1187,11 @@ inline void Rosmaster::pidLoop() {
             const double scale_i = (motor_scale_[i] > 0.0)
                 ? motor_scale_[i] : scale_global;
 
+            // measured is signed: positive = forward, negative = reverse.
             const double measured = std::clamp(
                 (velocity / scale_i) * 100.0, -200.0, 200.0);
 
-            // ── EMA on measured (input to D term) ─────────────────────────
-            // Filtering the signal directly avoids amplifying quantisation
-            // noise when we later divide by dt (≈40 ms) for the derivative.
+            // ── EMA on measured (for display quality) ─────────────────────
             motor_state_[i].measured_filtered =
                 kDerivAlpha           * motor_state_[i].measured_filtered
                 + (1.0 - kDerivAlpha) * measured;
@@ -1182,28 +1199,42 @@ inline void Rosmaster::pidLoop() {
             pid_measured_[i].store(measured, std::memory_order_relaxed);
 
             const double target = target_[i].load(std::memory_order_relaxed);
-            const double error  = target - measured;
+            const double error  = target - measured;  // signed
 
-            // ── Derivative of filtered measurement ────────────────────────
-            // d(measured)/dt approximated over one PID period (real dt).
-            // Minus sign: if the motor speeds up (measured rises), we reduce
-            // the command → negative contribution, hence "-d_term" in raw_cmd.
+            // ── EMA on error → D term (sign-correct in both directions) ───
+            // Filtering error (not measured) means the D term pushes harder
+            // when the error is growing and backs off when it is shrinking,
+            // with the correct sign regardless of rotation direction.
+            // Using error-derivative (not measured-derivative) also means
+            // a step change in target produces a positive D impulse that
+            // helps the motor accelerate toward the new setpoint.
+            const double err_filt_prev = motor_state_[i].error_filtered;
+            motor_state_[i].error_filtered =
+                kDerivAlpha           * err_filt_prev
+                + (1.0 - kDerivAlpha) * error;
+
             const double d_term = gains[i].kd
-                * (motor_state_[i].measured_filtered
-                   - motor_state_[i].prev_error)    // prev_error reused as
-                / dt;                               // prev_measured_filtered
-
-            motor_state_[i].prev_error = motor_state_[i].measured_filtered;
+                * (motor_state_[i].error_filtered - err_filt_prev)
+                / dt;
 
             // ── PID output with feedforward ───────────────────────────────
             const double raw_cmd =
                 target
                 + gains[i].kp * error
                 + gains[i].ki * motor_state_[i].integral
-                - d_term;
+                + d_term;
 
-            // ── Pre-integration anti-windup ────────────────────────────────
-            if (std::abs(raw_cmd) < 100.0) {
+            // ── Anti-windup (sign-aware) ───────────────────────────────────
+            // Allow integration when:
+            //   (a) output is not saturated  |raw_cmd| < 100, OR
+            //   (b) error and integral have opposite signs → integral is
+            //       winding DOWN toward zero, which is always safe.
+            // Case (b) is critical at direction reversal: the integrator
+            // charged in the forward direction must be able to discharge
+            // even while the output is saturated in the reverse direction.
+            const bool not_saturated  = std::abs(raw_cmd) < 100.0;
+            const bool winding_down   = (error * motor_state_[i].integral) < 0.0;
+            if (not_saturated || winding_down) {
                 motor_state_[i].integral += error * dt;
                 motor_state_[i].integral  = std::clamp(
                     motor_state_[i].integral, -80.0, 80.0);
