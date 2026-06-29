@@ -128,6 +128,22 @@
 //             and fights the new command for hundreds of milliseconds.
 //             (3) MotorPidState gains error_filtered field; prev_meas_filtered
 //             renamed prev_meas_filtered for clarity.
+//  v7 → v8 : [ADDED] Motor feedforward model — PWM = kS·sign(target) + kV·target
+//             + PID, compensating DC-motor static friction (dead zone) and the
+//             approximately-linear PWM→speed slope under load. Motor datasheet
+//             (333 RPM @ 0.15A no-load, 250 RPM @ 0.65A / 1 kg·cm rated load,
+//             stall 4 kg·cm @ 2.4A) shows ~25% speed sag under load and a
+//             non-negligible dead zone — the previous 1:1 `target` feedforward
+//             term implicitly assumed a perfectly linear, frictionless motor.
+//             [ADDED] Per-motor feedforward gains (kS[i], kV[i]) — consistent
+//             with the existing per-motor velocity scale design.
+//             [ADDED] calibrate_feedforward() — automatic PWM sweep per motor:
+//             ramps PWM 0→100% in small steps, records the PWM at which
+//             rotation first sustains (kS) and fits a linear PWM-vs-speed
+//             slope above the dead zone (kV) via least squares.
+//             [NOTE]  PID term now corrects the *residual* error around the
+//             feedforward prediction rather than carrying the full command,
+//             so kp/ki/kd may need re-tuning (likely smaller gains suffice).
 
 #include <array>
 #include <atomic>
@@ -289,6 +305,30 @@ public:
     // Injection directe des échelles après calibration externe
     void set_motor_scales(const std::array<double,4> & scales, double global);
 
+    // ── Motor feedforward (v8) ──────────────────────────────────────────────
+    // Model: pwm_ff = kS[i]·sign(target) + kV[i]·target   (target in %, [-100,100])
+    //   kS : static-friction / dead-zone offset (% PWM needed just to start moving)
+    //   kV : linear PWM-per-%-speed slope above the dead zone
+    // Calibrated automatically per motor via a PWM sweep (see below), or set
+    // directly with set_feedforward_gains() if you already have values.
+    //
+    // throttle_min/max_pct : sweep bounds (defaults span dead-zone to near-max)
+    // step_pct             : PWM increment per sweep point
+    // settle_ms            : time to wait for speed to stabilize at each step
+    // sample_ms            : window used to measure speed at each step
+    // Returns the average dead-zone PWM (%) across the 4 motors.
+    double calibrate_feedforward(int throttle_min_pct = 5,
+                                 int throttle_max_pct  = 70,
+                                 int step_pct          = 3,
+                                 int settle_ms         = 250,
+                                 int sample_ms         = 300);
+
+    void set_feedforward_gains(int motor_index, double kS, double kV);
+    void get_feedforward_gains(int motor_index, double & kS, double & kV) const;
+    void enable_feedforward(bool enable) {
+        feedforward_enabled_.store(enable, std::memory_order_relaxed);
+    }
+
     // Accès à writeMotorRaw depuis main() pour la calibration
     void writeMotorRaw_public(const std::array<double,4> & cmd) {
         writeMotorRaw(cmd);
@@ -385,14 +425,16 @@ private:
     //
     // PidGains      : shared between threads → protected by pid_gains_mutex_
     // MotorPidState : exclusive to the PID thread → no mutex required
+    // FeedforwardGains : shared between threads → protected by ff_mutex_
     //
-    // Control law (v7 — sign-correct for both directions):
+    // Control law (v8 — feedforward + sign-correct PID for both directions):
     //   measured[i]  = signed(delta_ticks) / window_dt / scale × 100   [%]
     //   meas_filt[i] = α·meas_filt_prev + (1−α)·measured               [EMA signal]
     //   error        = target − measured                                 [signed]
     //   err_filt[i]  = α·err_filt_prev  + (1−α)·error                  [EMA error]
     //   d_term       = kd · (err_filt − err_filt_prev) / dt             [+: error grows → push]
-    //   raw_cmd      = target + kp·error + ki·∫ + d_term
+    //   ff_term      = kS[i]·sign(target) + kV[i]·target                [feedforward]
+    //   raw_cmd      = ff_term + kp·error + ki·∫ + d_term
     //   anti-windup  : integrate if |raw_cmd|<100 OR sign(error)≠sign(∫) [allow wind-down]
     //   cmd          = clamp(raw_cmd, −100, 100)
     struct PidGains {
@@ -411,6 +453,15 @@ private:
         }
     };
 
+    // Per-motor feedforward model: pwm = kS·sign(target) + kV·target.
+    // kS absorbs static friction / dead zone (PWM% needed just to start
+    // moving). kV is the linear PWM-per-%-speed slope above the dead zone,
+    // measured under whatever load the calibration sweep was run with.
+    struct FeedforwardGains {
+        double kS{0.0};
+        double kV{1.0};   // 1.0 == previous behaviour (target passed through 1:1)
+    };
+
     // ── Internal helpers ──────────────────────────────────────────────────
     uint8_t checksum(const std::vector<uint8_t> & cmd) const;
     void    writeCmd(std::vector<uint8_t> & cmd);
@@ -424,6 +475,16 @@ private:
     // ── Software PID internal methods ─────────────────────────────────────
     void pidLoop();
     void writeMotorRaw(const std::array<double, 4> & cmd);
+
+    // Feedforward evaluation, shared by pidLoop() and calibrate_feedforward()
+    // diagnostics. Not used for the calibration sweep itself (which drives
+    // writeMotorRaw directly with known PWM steps).
+    inline double feedforwardOf(int i, double target) const {
+        const FeedforwardGains & g = ff_gains_[i];
+        if (target == 0.0) return 0.0;
+        const double sign = (target > 0.0) ? 1.0 : -1.0;
+        return g.kS * sign + g.kV * target;
+    }
 
     // ── Slope compensation helpers ─────────────────────────────────────────
     inline double reserve_headroom(double cmd) const {
@@ -529,6 +590,14 @@ private:
 
     // Per-motor state — exclusive to the PID thread, no mutex needed
     std::array<MotorPidState, 4> motor_state_{};
+
+    // ── Feedforward — members (v8) ─────────────────────────────────────────
+    // Shared gains — accessed under ff_mutex_. Read once per pidLoop()
+    // iteration (snapshot pattern, same as pid_gains_/motor_gains_).
+    mutable std::mutex             ff_mutex_;
+    std::array<FeedforwardGains,4> ff_gains_{};
+    std::atomic<bool>              feedforward_enabled_{false};
+    bool                            feedforward_calibrated_{false};
 
     // Setpoints deposited by set_motor(), consumed by pidLoop()
     std::array<std::atomic<double>, 4> target_{};
@@ -1078,7 +1147,7 @@ inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
 
 // ── pidLoop ───────────────────────────────────────────────────────────────────
 //
-// Per-motor control law (v7 — sign-correct in both rotation directions):
+// Per-motor control law (v8 — feedforward + sign-correct PID):
 //
 //  Velocity measurement (timestamp-based window, signed):
 //   delta[i]  = int32(enc_now[i] − oldest_slot.enc[i])   (signed modulo-2³²)
@@ -1097,10 +1166,23 @@ inline void Rosmaster::writeMotorRaw(const std::array<double, 4> & cmd) {
 //     → negative when error is shrinking (motor catching up) → backs off
 //     → sign is consistent regardless of rotation direction
 //
-//  PID output:
-//   raw_cmd = target + kp·error + ki·integral + d_term
+//  Feedforward (v8):
+//   ff_term = kS[i]·sign(target) + kV[i]·target
+//     → kS compensates static friction / dead zone (PWM% needed just to
+//       start moving — the motor will not turn below this regardless of
+//       the linear term)
+//     → kV is the linear PWM-per-%-speed slope above the dead zone,
+//       measured under whatever load was present during calibration
+//     → when feedforward is disabled or uncalibrated, ff_gains_[i] defaults
+//       to {kS=0, kV=1}, which reduces ff_term to "target" exactly as in v7
 //
-//  Anti-windup (improved):
+//  PID output:
+//   raw_cmd = ff_term + kp·error + ki·integral + d_term
+//     → the PID now corrects the *residual* error around the feedforward
+//       prediction, instead of carrying the whole command as in v7. Gains
+//       tuned for v7 will likely need to be reduced after calibration.
+//
+//  Anti-windup (improved, v7):
 //   Integrate if |raw_cmd| < 100  (not saturated)
 //   OR if sign(error) ≠ sign(integral)  (integral winding DOWN — always allow)
 //   This lets the integrator discharge during direction reversal even when
@@ -1172,6 +1254,14 @@ inline void Rosmaster::pidLoop() {
                 gains[i] = motor_gains_override_[i] ? motor_gains_[i] : pid_gains_;
         }
 
+        // ── Feedforward gains snapshot ─────────────────────────────────────
+        std::array<FeedforwardGains, 4> ff_gains_snapshot;
+        const bool ff_on = feedforward_enabled_.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(ff_mutex_);
+            ff_gains_snapshot = ff_gains_;
+        }
+
         const double scale_global = std::max(ticks_per_second_at_100pct_, 1.0);
 
         std::array<double, 4> cmd_out{};
@@ -1217,9 +1307,25 @@ inline void Rosmaster::pidLoop() {
                 * (motor_state_[i].error_filtered - err_filt_prev)
                 / dt;
 
-            // ── PID output with feedforward ───────────────────────────────
+            // ── Feedforward term (v8) ───────────────────────────────────────
+            // pwm_ff = kS·sign(target) + kV·target.
+            // sign(target)==0 when target==0 → ff_term==0 exactly, so the
+            // motor is not commanded to fight static friction while
+            // explicitly stopped (no creeping at target=0).
+            double ff_term = target;   // v7-equivalent fallback (kS=0, kV=1)
+            if (ff_on) {
+                const FeedforwardGains & g = ff_gains_snapshot[i];
+                if (target == 0.0) {
+                    ff_term = 0.0;
+                } else {
+                    const double sign = (target > 0.0) ? 1.0 : -1.0;
+                    ff_term = g.kS * sign + g.kV * target;
+                }
+            }
+
+            // ── PID output: feedforward + residual-error correction ───────
             const double raw_cmd =
-                target
+                ff_term
                 + gains[i].kp * error
                 + gains[i].ki * motor_state_[i].integral
                 + d_term;
@@ -1265,6 +1371,11 @@ inline void Rosmaster::enable_pid_control(double kp, double ki, double kd,
                   << ticks_per_sec
                   << " ticks/s). Run calibrate_pid_scale() for accurate control.\n";
 
+    if (!feedforward_calibrated_)
+        std::cerr << "Rosmaster: NOTE — feedforward not calibrated yet. "
+                     "Run calibrate_feedforward() and enable_feedforward(true) "
+                     "for dead-zone-compensated control.\n";
+
     if (pid_running_.load()) return;   // idempotent
 
     ticks_per_second_at_100pct_ = ticks_per_sec;
@@ -1286,7 +1397,9 @@ inline void Rosmaster::enable_pid_control(double kp, double ki, double kd,
 
     std::cout << "Rosmaster: PID enabled @ " << kPidHz << " Hz"
               << "  window=" << kVelWindow << " cycles"
-              << "  scale=" << ticks_per_second_at_100pct_ << " ticks/s\n";
+              << "  scale=" << ticks_per_second_at_100pct_ << " ticks/s"
+              << "  feedforward=" << (feedforward_enabled_.load() ? "ON" : "OFF")
+              << "\n";
 }
 
 // ── disable_pid_control ───────────────────────────────────────────────────────
@@ -1343,8 +1456,8 @@ inline void Rosmaster::configure_slope_compensation(bool enabled,
                                                      uint64_t timeout_ns) {
     slope_comp_enabled_ = enabled;
     k_gravity_          = k_gravity;
-    deadband_rad_       = deadband_rad;
-    pitch_timeout_ns_   = timeout_ns;
+    deadband_rad_        = deadband_rad;
+    pitch_timeout_ns_    = timeout_ns;
 }
 
 // ── set_max_pwm_flat ──────────────────────────────────────────────────────────
@@ -1613,6 +1726,207 @@ inline void Rosmaster::set_motor_scales(const std::array<double,4> & scales,
     ticks_per_second_at_100pct_ = global;
     pid_scale_calibrated_ = true;
     std::cout << "Rosmaster: motor_scale_ updated\n";
+}
+
+// ── set_feedforward_gains / get_feedforward_gains ─────────────────────────────
+inline void Rosmaster::set_feedforward_gains(int motor_index, double kS, double kV) {
+    if (motor_index < 0 || motor_index > 3) return;
+    std::lock_guard<std::mutex> lk(ff_mutex_);
+    ff_gains_[motor_index] = {kS, kV};
+    feedforward_calibrated_ = true;
+}
+
+inline void Rosmaster::get_feedforward_gains(int motor_index,
+                                              double & kS, double & kV) const {
+    if (motor_index < 0 || motor_index > 3) { kS = 0.0; kV = 1.0; return; }
+    std::lock_guard<std::mutex> lk(ff_mutex_);
+    kS = ff_gains_[motor_index].kS;
+    kV = ff_gains_[motor_index].kV;
+}
+
+// ── calibrate_feedforward ──────────────────────────────────────────────────────
+//
+// Automatic PWM-sweep calibration of the per-motor feedforward model
+//   pwm = kS·sign(v) + kV·v     (v = commanded %, pwm = PWM % applied)
+//
+// Method (per motor, independently):
+//   1. Sweep PWM upward from throttle_min_pct to throttle_max_pct in
+//      step_pct increments. At each step:
+//        a. Command all 4 motors to the current PWM (every motor is swept
+//           at the same time — simpler hardware sequencing; per-motor
+//           results are still independent because each motor's own
+//           encoder is read).
+//        b. Wait settle_ms for mechanical transients to die down.
+//        c. Measure speed over sample_ms via encoder delta.
+//   2. kS[i] = the PWM% of the first step at which motor i's measured
+//      speed exceeds a small "moving" threshold (a few ticks over
+//      sample_ms — i.e. the dead zone has just been crossed).
+//   3. kV[i] = least-squares slope of (PWM% vs measured speed%) using
+//      only the points at or above kS[i] (the linear region) — fit as
+//      PWM = kS + kV·speed, i.e. kV = ΔPWM / Δspeed in the linear region.
+//   4. Results are written into ff_gains_[i] and feedforward_calibrated_
+//      is set true. Caller must still call enable_feedforward(true).
+//
+// Preconditions: PID disabled, wheels free to spin, auto-report active.
+// Returns the average dead-zone PWM (kS) across the 4 motors.
+//
+inline double Rosmaster::calibrate_feedforward(int throttle_min_pct,
+                                                int throttle_max_pct,
+                                                int step_pct,
+                                                int settle_ms,
+                                                int sample_ms) {
+    if (pid_enabled_.load())
+        throw std::logic_error(
+            "Rosmaster::calibrate_feedforward(): disable PID control first");
+    if (throttle_min_pct < 1 || throttle_min_pct >= throttle_max_pct)
+        throw std::invalid_argument(
+            "Rosmaster::calibrate_feedforward(): invalid throttle range");
+    if (throttle_max_pct > 100)
+        throw std::invalid_argument(
+            "Rosmaster::calibrate_feedforward(): throttle_max_pct > 100");
+    if (step_pct < 1)
+        throw std::invalid_argument(
+            "Rosmaster::calibrate_feedforward(): step_pct < 1");
+
+    // Minimum tick count over sample_ms to declare "motor is moving".
+    // Chosen conservatively above encoder/electrical noise floor.
+    constexpr double kMovingTickThreshold = 8.0;
+
+    std::cout << "\nRosmaster: feedforward calibration — PWM sweep "
+              << throttle_min_pct << "% to " << throttle_max_pct
+              << "% step " << step_pct << "%\n"
+              << "Ensure all wheels are free to spin.\n";
+
+    // Per-motor accumulated sweep samples: (pwm_pct, measured_speed_pct)
+    struct SweepPoint { double pwm; double speed; };
+    std::array<std::vector<SweepPoint>, 4> sweep;
+
+    // Dead-zone PWM per motor — first step where the motor was observed
+    // moving above kMovingTickThreshold. -1 until found.
+    std::array<double, 4> dead_zone_pwm = {-1.0, -1.0, -1.0, -1.0};
+
+    const double dt_sample = sample_ms / 1000.0;
+
+    // Start from rest.
+    writeMotorRaw({0.0, 0.0, 0.0, 0.0});
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    for (int pwm = throttle_min_pct; pwm <= throttle_max_pct; pwm += step_pct) {
+        const double p = static_cast<double>(pwm);
+
+        writeMotorRaw({p, p, p, p});
+        std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
+
+        int ma[4];
+        get_motor_encoder(ma[0], ma[1], ma[2], ma[3]);
+        std::this_thread::sleep_for(std::chrono::milliseconds(sample_ms));
+        int mb[4];
+        get_motor_encoder(mb[0], mb[1], mb[2], mb[3]);
+
+        std::cout << "  PWM=" << pwm << "% :";
+        for (int i = 0; i < 4; ++i) {
+            const int32_t d = static_cast<int32_t>(
+                static_cast<uint32_t>(mb[i]) - static_cast<uint32_t>(ma[i]));
+            const double ticks = std::abs(static_cast<double>(d));
+            const double scale_i = (motor_scale_[i] > 0.0)
+                ? motor_scale_[i] : std::max(ticks_per_second_at_100pct_, 1.0);
+            const double speed_pct = (ticks / dt_sample) / scale_i * 100.0;
+
+            std::cout << "  M" << (i+1) << "=" << static_cast<int>(ticks) << "t";
+
+            if (dead_zone_pwm[i] < 0.0 && ticks >= kMovingTickThreshold) {
+                dead_zone_pwm[i] = p;
+            }
+            // Only keep points once the motor is confirmed moving — points
+            // below the dead zone would otherwise pull the linear fit
+            // toward the origin and bias kV low.
+            if (dead_zone_pwm[i] >= 0.0) {
+                sweep[i].push_back({p, speed_pct});
+            }
+        }
+        std::cout << "\n";
+    }
+
+    writeMotorRaw({0.0, 0.0, 0.0, 0.0});
+
+    // ── Per-motor least-squares fit: PWM = kS + kV·speed ──────────────────
+    // Fitting PWM as a function of speed (rather than the reverse) is what
+    // we actually need at runtime: given a desired speed, what PWM do we
+    // feed forward? Standard linear least squares on (x=speed, y=pwm).
+    double dead_zone_sum = 0.0;
+    int    dead_zone_n   = 0;
+
+    std::cout << "\n=== Feedforward fit results ===\n";
+    {
+        std::lock_guard<std::mutex> lk(ff_mutex_);
+        for (int i = 0; i < 4; ++i) {
+            if (dead_zone_pwm[i] < 0.0 || sweep[i].size() < 3) {
+                std::cerr << "  [WARN] M" << (i+1)
+                          << " : motor never exceeded moving threshold or "
+                             "too few points — feedforward NOT updated for "
+                             "this motor (kS=0, kV=1 kept)\n";
+                continue;
+            }
+
+            const size_t n = sweep[i].size();
+            double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+            for (const auto & pt : sweep[i]) {
+                sx  += pt.speed;
+                sy  += pt.pwm;
+                sxx += pt.speed * pt.speed;
+                sxy += pt.speed * pt.pwm;
+            }
+            const double denom = static_cast<double>(n) * sxx - sx * sx;
+
+            double kV, kS;
+            if (std::abs(denom) < 1e-9) {
+                // Degenerate (near-vertical or single-speed data) — fall
+                // back to dead-zone PWM as kS, kV from a single ratio.
+                kS = dead_zone_pwm[i];
+                kV = (sy / static_cast<double>(n)) / std::max(sx / n, 1.0);
+            } else {
+                kV = (static_cast<double>(n) * sxy - sx * sy) / denom;
+                kS = (sy - kV * sx) / static_cast<double>(n);
+                // kS from the fit's y-intercept can be noisy/negative if
+                // the linear region doesn't extrapolate cleanly to v=0.
+                // The directly observed dead-zone crossing is a more
+                // trustworthy floor — use it when the fit disagrees by a
+                // large margin in the unsafe (too-low) direction.
+                if (kS < dead_zone_pwm[i] * 0.5) {
+                    kS = dead_zone_pwm[i];
+                }
+            }
+
+            kV = std::max(kV, 0.1);   // guard against non-positive slope
+            kS = std::clamp(kS, 0.0, 50.0);
+
+            ff_gains_[i] = {kS, kV};
+            dead_zone_sum += dead_zone_pwm[i];
+            ++dead_zone_n;
+
+            std::cout << "  M" << (i+1)
+                      << "  kS=" << std::fixed << std::setprecision(2) << kS
+                      << "%  kV=" << kV
+                      << "  (dead zone observed at " << dead_zone_pwm[i]
+                      << "% PWM, " << n << " linear-region points)\n";
+        }
+        std::cout << std::defaultfloat;
+    }
+
+    if (dead_zone_n == 0)
+        throw std::runtime_error(
+            "Rosmaster::calibrate_feedforward(): no motor exceeded the "
+            "moving threshold during the sweep — check wiring, increase "
+            "throttle_max_pct, or verify wheels are free to spin");
+
+    feedforward_calibrated_ = true;
+
+    const double avg_dead_zone = dead_zone_sum / dead_zone_n;
+    std::cout << "Rosmaster: feedforward calibrated — average dead zone = "
+              << avg_dead_zone << "% PWM. "
+              << "Call enable_feedforward(true) to activate.\n";
+
+    return avg_dead_zone;
 }
 
 // =============================================================================

@@ -11,8 +11,18 @@
 // =============================================================================
 //  Banc de test MecaMate — main()
 //
-//  La calibration multi-runs est maintenant intégrée dans la classe via
-//  Rosmaster::calibrate_motor_scales().  Ce fichier ne contient plus que le
+//  Séquence complète, automatique, un seul run :
+//    1. Ouverture port + thread réception
+//    2. Auto-report + attente des premiers paquets
+//    3. Calibration des échelles moteur (calibrate_motor_scales)
+//    4. Calibration du feedforward (calibrate_feedforward) — kS/kV par moteur
+//    5. Activation PID avec feedforward actif
+//    6. Test de convergence (avance -20%) avec log détaillé
+//    7. Arrêt propre
+//
+//  La calibration multi-runs et la calibration feedforward sont intégrées
+//  dans la classe (Rosmaster::calibrate_motor_scales /
+//  Rosmaster::calibrate_feedforward).  Ce fichier ne contient que le
 //  séquenceur de test.
 // =============================================================================
 int main()
@@ -43,9 +53,10 @@ int main()
         }
         std::cout << "Batterie : " << bot.get_battery_voltage() << " V\n";
 
-        // ── 4. Calibration multi-runs avec warmup intégré ─────────────────
+        // ── 4. Calibration des échelles moteur (multi-runs, warmup intégré) ─
         // warmup_ms=3000 : 3 s à 60% pour stabiliser les bobines DC.
         // n_runs=5 : moyenne tronquée sur 3 runs intérieurs (min+max rejetés).
+        std::cout << "\n========== ÉTAPE 1/2 : calibration des échelles ==========\n";
         const double scale_global = bot.calibrate_motor_scales(
             /*throttle_pct=*/ 60,
             /*duration_ms=*/  800,
@@ -53,13 +64,45 @@ int main()
             /*warmup_ms=*/  3000,
             /*use_per_motor=*/ true);
 
-        // ── 5. Activation PID ─────────────────────────────────────────────
-        // kd=0.0 confirmé sur banc (oscillation mecanum mécanique, pas logicielle).
-        // ki=0.1 : correction statique lente mais stable.
-        bot.enable_pid_control(0.6, 0.1, 0.0, scale_global);
+        // ── 5. Calibration du feedforward (kS / kV par moteur) ─────────────
+        // Balayage PWM 5% → 70% par pas de 3%, palier 250 ms + mesure 300 ms.
+        // Les roues doivent être libres de tourner (même précondition que
+        // calibrate_motor_scales — déjà garantie à ce stade du run).
+        std::cout << "\n========== ÉTAPE 2/2 : calibration feedforward ==========\n";
+        const double avg_dead_zone = bot.calibrate_feedforward(
+            /*throttle_min_pct=*/  5,
+            /*throttle_max_pct=*/ 70,
+            /*step_pct=*/          3,
+            /*settle_ms=*/       250,
+            /*sample_ms=*/       300);
 
-        // ── 6. Test de convergence ────────────────────────────────────────
-        std::cout << "\nTest convergence PID : avance 50 s @ -20%\n";
+        std::cout << "\nDead zone moyenne mesurée : " << avg_dead_zone
+                  << "% PWM\n";
+
+        for (int i = 0; i < 4; ++i) {
+            double kS, kV;
+            bot.get_feedforward_gains(i, kS, kV);
+            std::cout << "  M" << (i + 1)
+                      << " : kS=" << std::fixed << std::setprecision(2) << kS
+                      << "  kV=" << kV << "\n";
+        }
+
+        bot.enable_feedforward(true);
+
+        // ── 6. Activation PID (feedforward actif) ──────────────────────────
+        // Le PID ne corrige plus que le résidu autour de la prédiction
+        // feedforward — gains volontairement réduits par rapport au v7
+        // (qui portait toute la commande sur kp/ki). Re-tuner sur banc si
+        // la convergence ci-dessous est trop lente ou trop oscillante.
+        // kd=0.0 conservé : oscillation mecanum mécanique, pas logicielle,
+        // confirmée sur banc précédemment.
+        bot.enable_pid_control(0.3, 0.05, 0.0, scale_global);
+
+        std::cout << "\nPID activé — feedforward=" 
+                  << (avg_dead_zone > 0.0 ? "ON" : "OFF") << "\n";
+
+        // ── 7. Test de convergence ────────────────────────────────────────
+        std::cout << "\nTest convergence PID+FF : avance 50 s @ -20%\n";
         std::cout << "  "
                 << std::setw(6) << "t(ms)"
                 << std::setw(8) << "raw_M1" << std::setw(8) << "raw_M2"
@@ -94,7 +137,7 @@ int main()
             std::cout << "\n";
         }
 
-        // ── 7. Arrêt propre ───────────────────────────────────────────────
+        // ── 8. Arrêt propre ───────────────────────────────────────────────
         bot.set_motor(0.0, 0.0, 0.0, 0.0);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));  // 2 cycles PID
         bot.disable_pid_control();
