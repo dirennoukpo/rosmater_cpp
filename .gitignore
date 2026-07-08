@@ -67,3 +67,20 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Generated API documentation (produced by `doxygen Doxyfile`)
+/docs/html/
+/docs/latex/
+/docs/xml/
+/docs/man/
+/docs/rtf/
+
+# Test-bench / scratch binaries
+main_test
+mecamate
+compile_check
+
+# Editor / IDE
+.vscode/
+.idea/
+*~

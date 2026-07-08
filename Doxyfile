@@ -1,0 +1,136 @@
+# Doxyfile — API documentation configuration for the Rosmaster C++ driver.
+#
+# Generate the HTML docs with:
+#     doxygen Doxyfile
+# then open docs/html/index.html.
+#
+# Requires:  doxygen  (sudo apt-get install doxygen)
+# Optional:  graphviz (sudo apt-get install graphviz) for call/collaboration graphs.
+#
+# This file is intentionally verbose and commented so the doc build is easy to
+# tweak. Unset options fall back to Doxygen defaults.
+
+#---------------------------------------------------------------------------
+# Project
+#---------------------------------------------------------------------------
+PROJECT_NAME           = "Rosmaster C++ Driver — MecaMate"
+PROJECT_NUMBER         = "v8"
+PROJECT_BRIEF          = "Single-header C++17 driver for the Yahboom Rosmaster (software velocity PID + feedforward + calibration)"
+OUTPUT_DIRECTORY       = docs
+CREATE_SUBDIRS         = NO
+OUTPUT_LANGUAGE        = English
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+TAB_SIZE               = 4
+
+#---------------------------------------------------------------------------
+# Build: what to extract
+#---------------------------------------------------------------------------
+# EXTRACT_ALL keeps undocumented entities in the output; combined with the
+# thorough in-source comments this yields a complete reference.
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_PRIV_VIRTUAL   = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_ANON_NSPACES   = YES
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+INTERNAL_DOCS          = YES
+CASE_SENSE_NAMES       = YES
+SHOW_INCLUDE_FILES     = YES
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+# Treat the first sentence of a /** */ block (JavaDoc style) as the @brief.
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+MULTILINE_CPP_IS_BRIEF = NO
+INHERIT_DOCS           = YES
+
+# It is a C++ project (not C): keep full C++ member grouping.
+OPTIMIZE_OUTPUT_FOR_C  = NO
+
+#---------------------------------------------------------------------------
+# Input
+#---------------------------------------------------------------------------
+# The header carries the full API docs; docs/mainpage.md is a purpose-built landing
+# page. The repo's README.md / CONTRIBUTING.md are the GitHub-facing guides and are
+# intentionally NOT fed to Doxygen (their GitHub-style anchor TOCs do not map to
+# Doxygen section ids and would emit spurious \ref warnings).
+INPUT                  = Rosmaster.hpp docs/mainpage.md
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.hpp *.h *.cpp *.md
+RECURSIVE              = NO
+EXAMPLE_PATH           =
+# Render docs/mainpage.md as the documentation landing page.
+USE_MDFILE_AS_MAINPAGE = docs/mainpage.md
+
+#---------------------------------------------------------------------------
+# Source browsing
+#---------------------------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+REFERENCES_LINK_SOURCE = YES
+VERBATIM_HEADERS       = YES
+
+#---------------------------------------------------------------------------
+# Diagnostics
+#---------------------------------------------------------------------------
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = NO
+
+#---------------------------------------------------------------------------
+# HTML output
+#---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_FILE_EXTENSION    = .html
+HTML_COLORSTYLE        = AUTO_LIGHT
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+SEARCHENGINE           = YES
+HTML_DYNAMIC_SECTIONS  = YES
+
+#---------------------------------------------------------------------------
+# Other outputs (off by default; enable if you need them)
+#---------------------------------------------------------------------------
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+GENERATE_XML           = NO
+
+#---------------------------------------------------------------------------
+# Preprocessor — the driver is header-only and platform-guarded.
+# Define the POSIX path so Doxygen documents the Linux implementation
+# (leave _WIN32 undefined).
+#---------------------------------------------------------------------------
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = YES
+PREDEFINED             = __linux__ __unix__
+SKIP_FUNCTION_MACROS   = YES
+
+#---------------------------------------------------------------------------
+# Diagrams (graphviz). HAVE_DOT is auto-enabled when 'dot' is on PATH.
+#---------------------------------------------------------------------------
+HAVE_DOT               = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+DIRECTORY_GRAPH        = YES
+DOT_MULTI_TARGETS      = YES
