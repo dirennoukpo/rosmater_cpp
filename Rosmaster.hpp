@@ -5,7 +5,7 @@
 ** Login   <diren.noukpo@epitech.eu>
 **
 ** Started on  Fri May 15 17:18:57 2026 dirennoukpo
-** Last update Wed Jun 17 00:00:00 2026 dirennoukpo
+** Last update Wed Jul 14 1:37:19 PM 2026 dirennoukpo
 */
 
 /**
@@ -174,6 +174,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -643,6 +644,48 @@ public:
      */
     void   get_motor_encoder(int & m1, int & m2, int & m3, int & m4) const;
     /**
+     * @brief Read the four wheel speeds as measured by the firmware, raw (blocking round-trip).
+     *
+     * The board differentiates its own encoders every 10 ms and reports the result directly,
+     * so you get a wheel velocity without having to differentiate get_motor_encoder() yourself.
+     * All four wheels are positive when the robot drives forward -- the same frame of reference
+     * as get_motion_data().
+     *
+     * @return {FL, FR, RL, RR} in m/s, or std::nullopt on a ~30 ms timeout.
+     * @note Request-only: this datum is NEVER auto-reported, so each call sends a
+     *       FUNC_REQUEST_DATA and polls. Requires the receive thread; auto-report is not needed.
+     * @note std::optional rather than a {-1,-1,-1,-1} sentinel ON PURPOSE: -1 m/s is a
+     *       perfectly legitimate wheel speed, so a sentinel would be indistinguishable from data.
+     *       std::nullopt is returned when the board does not answer, e.g. it runs a firmware older
+     *       than V3.5.1 that has no 0x08 report.
+     * @warning Blocks the calling thread for up to ~30 ms. Fine for diagnostics and PID tuning;
+     *          do NOT put it in a ros2_control read() hot path.
+     * @warning Writes to the serial port from the calling thread. If the software PID is running,
+     *          its 25 Hz writeMotorRaw() writes concurrently and SerialPort is not internally
+     *          synchronised (a pre-existing property of this class, shared with get_version() and
+     *          get_motion_pid()).
+     * @see get_motor_speed_lpf, get_motor_encoder, get_pid_measured
+     */
+    std::optional<std::array<double, 4>> get_motor_speed_raw();
+    /**
+     * @brief Read the four wheel speeds after the firmware's low-pass filter (blocking round-trip).
+     *
+     * Same payload as get_motor_speed_raw(), but passed through a first-order IIR on the board:
+     * y[n] += 0.2 * (x[n] - y[n]) at a 10 ms sampling period, i.e. tau ~= 40 ms and a cutoff
+     * around 4 Hz. Much quieter than the raw value -- it attenuates encoder dither by roughly a
+     * factor of ten -- at the cost of a lag on acceleration (about 25 mm/s behind the raw value
+     * on a 0.76 m/s^2 ramp, measured on the bench).
+     *
+     * Prefer this one for telemetry, logging and anything a human reads; prefer
+     * get_motor_speed_raw() when you need the freshest possible measurement.
+     *
+     * @return {FL, FR, RL, RR} in m/s, or std::nullopt on a ~30 ms timeout.
+     * @note Same request-only mechanics, same blocking cost and same serial-write caveat as
+     *       get_motor_speed_raw(); see that method's notes.
+     * @see get_motor_speed_raw
+     */
+    std::optional<std::array<double, 4>> get_motor_speed_lpf();
+    /**
      * @brief Query the controller's firmware motion-PID gains (blocking round-trip).
      * @return {kp, ki, kd} read back from the board, or {-1,-1,-1} on timeout (~20 ms).
      * @note Sends a request then polls atomics filled by the receive thread; requires the receive
@@ -970,6 +1013,16 @@ public:
     static constexpr uint8_t FUNC_PWM_SERVO_ALL    = 0x04;
     static constexpr uint8_t FUNC_RGB              = 0x05;
     static constexpr uint8_t FUNC_RGB_EFFECT       = 0x06;
+    // Speed of the four motors, in mm/s on the wire (int16 x4, little-endian).
+    // RAW is computed straight from the encoders; LPF is the same value after a
+    // first-order IIR in the firmware (alpha = 0.2 at a 10 ms sampling period, so
+    // tau ~= 40 ms, cutoff ~4 Hz).
+    // Request-only: unlike FUNC_REPORT_* below, these are NEVER auto-reported. They
+    // are pulled with FUNC_REQUEST_DATA, exactly like FUNC_VERSION.
+    // Requires firmware >= V3.5.1 with the motor-speed report; older boards simply
+    // never answer, which is why the getters return std::nullopt on timeout.
+    static constexpr uint8_t FUNC_REPORT_MOTOR_RAW = 0x08;
+    static constexpr uint8_t FUNC_REPORT_MOTOR_LPF = 0x09;
     static constexpr uint8_t FUNC_REPORT_SPEED     = 0x0A;
     static constexpr uint8_t FUNC_REPORT_MPU_RAW   = 0x0B;
     static constexpr uint8_t FUNC_REPORT_IMU_ATT   = 0x0C;
@@ -1396,6 +1449,18 @@ private:
     /// Battery voltage in decivolts (tenths of a volt); get_battery_voltage() returns
     /// /10.0 as volts. Written by recv_thread_ from FUNC_REPORT_SPEED, read on the app thread.
     std::atomic<int>    battery_voltage_{0};
+
+    /// Per-wheel speed {FL,FR,RL,RR} in m/s, from the request-only FUNC_REPORT_MOTOR_RAW
+    /// (straight from the encoders) and FUNC_REPORT_MOTOR_LPF (firmware first-order IIR).
+    /// The wire carries mm/s; parseData() divides by 1000 so the unit matches
+    /// get_motion_data(), which is what the rest of this driver exposes.
+    /// motor_speed_*_ok_ are the request/reply arrival sentinels, cleared by the getter
+    /// before it sends and release-stored by recv_thread_ once the frame is decoded.
+    /// All lock-free atomics: recv_thread_ writes, the app thread reads.
+    std::array<std::atomic<double>, 4> motor_speed_raw_{};
+    std::array<std::atomic<double>, 4> motor_speed_lpf_{};
+    std::atomic<bool>   motor_speed_raw_ok_{false};
+    std::atomic<bool>   motor_speed_lpf_ok_{false};
 
     /// Last bus-servo readback: read_id_ = servo id, read_val_ = raw position value from
     /// a FUNC_UART_SERVO reply. Written by recv_thread_, polled by the app thread; atomics.
@@ -1942,6 +2007,25 @@ inline void Rosmaster::parseData(uint8_t ext_type,
         encoder_m4_ = le32s(d, 12);
         // Release-store unblocks the startup wait and marks the serial link "live".
         encoder_received_.store(true, std::memory_order_release);
+    }
+    // Raw per-wheel speed: four int16 in mm/s -> m/s. All four wheels are positive when
+    // the robot drives forward (same frame of reference as get_motion_data()).
+    else if (ext_type == FUNC_REPORT_MOTOR_RAW) {
+        for (int i = 0; i < 4; ++i)
+            motor_speed_raw_[i].store(le16s(d, i * 2) / 1000.0,
+                                      std::memory_order_relaxed);
+        // Release pairs with the acquire in get_motor_speed_raw(): once the flag reads
+        // true, the four speeds above are guaranteed visible to the app thread.
+        motor_speed_raw_ok_.store(true, std::memory_order_release);
+        if (debug_) std::cout << "FUNC_REPORT_MOTOR_RAW\n";
+    }
+    // Same payload, but after the firmware's first-order low-pass filter.
+    else if (ext_type == FUNC_REPORT_MOTOR_LPF) {
+        for (int i = 0; i < 4; ++i)
+            motor_speed_lpf_[i].store(le16s(d, i * 2) / 1000.0,
+                                      std::memory_order_relaxed);
+        motor_speed_lpf_ok_.store(true, std::memory_order_release);
+        if (debug_) std::cout << "FUNC_REPORT_MOTOR_LPF\n";
     }
     // Bus-servo read-back: d[0] = servo id, le16 at d[1] = position/parameter value.
     else if (ext_type == FUNC_UART_SERVO) {
@@ -3613,6 +3697,54 @@ inline double Rosmaster::get_battery_voltage() const {
 inline void Rosmaster::get_motor_encoder(int & m1, int & m2, int & m3, int & m4) const {
     m1 = encoder_m1_; m2 = encoder_m2_;
     m3 = encoder_m3_; m4 = encoder_m4_;
+}
+
+/** @brief Request-then-poll the firmware's own per-wheel speed measurement (raw).
+ *  Clears the arrival sentinel, sends FUNC_REQUEST_DATA(0x08), then spins up to
+ *  ~30 ms on the atomics receiveLoop fills. Returns std::nullopt on timeout --
+ *  never a numeric sentinel, because any value in [-32.768, 32.767] m/s is a
+ *  legitimate reading (see the header declaration). */
+inline std::optional<std::array<double, 4>> Rosmaster::get_motor_speed_raw() {
+    // Clear BEFORE requesting: otherwise a late reply from a previous call could be
+    // mistaken for this one's answer.
+    motor_speed_raw_ok_.store(false, std::memory_order_release);
+    requestData(FUNC_REPORT_MOTOR_RAW);
+    for (int i = 0; i < 30; ++i) {
+        // acquire pairs with parseData's release store: once the flag reads true, the
+        // four speeds are guaranteed visible to this thread.
+        if (motor_speed_raw_ok_.load(std::memory_order_acquire)) {
+            return std::array<double, 4>{
+                motor_speed_raw_[0].load(std::memory_order_relaxed),
+                motor_speed_raw_[1].load(std::memory_order_relaxed),
+                motor_speed_raw_[2].load(std::memory_order_relaxed),
+                motor_speed_raw_[3].load(std::memory_order_relaxed)
+            };
+        }
+        delay_ms(1);
+    }
+    // No answer: either the link is down, or the board predates the 0x08 report.
+    if (debug_) std::cerr << "get_motor_speed_raw: timeout (firmware < V3.5.1?)\n";
+    return std::nullopt;
+}
+
+/** @brief Same as get_motor_speed_raw(), but pulls the firmware's low-pass-filtered
+ *  speed (FUNC_REPORT_MOTOR_LPF, 0x09): quieter, but lagging on acceleration. */
+inline std::optional<std::array<double, 4>> Rosmaster::get_motor_speed_lpf() {
+    motor_speed_lpf_ok_.store(false, std::memory_order_release);
+    requestData(FUNC_REPORT_MOTOR_LPF);
+    for (int i = 0; i < 30; ++i) {
+        if (motor_speed_lpf_ok_.load(std::memory_order_acquire)) {
+            return std::array<double, 4>{
+                motor_speed_lpf_[0].load(std::memory_order_relaxed),
+                motor_speed_lpf_[1].load(std::memory_order_relaxed),
+                motor_speed_lpf_[2].load(std::memory_order_relaxed),
+                motor_speed_lpf_[3].load(std::memory_order_relaxed)
+            };
+        }
+        delay_ms(1);
+    }
+    if (debug_) std::cerr << "get_motor_speed_lpf: timeout (firmware < V3.5.1?)\n";
+    return std::nullopt;
 }
 
 /** @brief Read back the MCU's OWN motor-PID gains (distinct from this driver's
