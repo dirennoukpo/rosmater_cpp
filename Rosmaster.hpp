@@ -5,7 +5,7 @@
 ** Login   <diren.noukpo@epitech.eu>
 **
 ** Started on  Fri May 15 17:18:57 2026 dirennoukpo
-** Last update Wed Jul 14 1:37:19 PM 2026 dirennoukpo
+** Last update Thu Jul 15 12:08:53 PM 2026 dirennoukpo
 */
 
 /**
@@ -685,6 +685,25 @@ public:
      * @see get_motor_speed_raw
      */
     std::optional<std::array<double, 4>> get_motor_speed_lpf();
+    /**
+     * @brief Snapshot the firmware's low-pass wheel speeds {FL,FR,RL,RR} in m/s from the
+     *        PUSHED 0x09 auto-report -- lock-free, never blocks, no round-trip.
+     *
+     * Unlike get_motor_speed_lpf() (request-then-poll), this reads the atomics that
+     * receiveLoop() fills on every 0x09 frame the firmware pushes at 100 Hz. Meant for the
+     * ros2_control read() hot path, exactly like get_motor_encoder() / get_accelerometer_data().
+     *
+     * @param fresh out (optional): true once the first pushed 0x09 frame has arrived (firmware
+     *        with the retuned auto-report that pushes 0x09). Stays true while the stream runs;
+     *        false against firmware that never pushes 0x09 -- differentiate get_motor_encoder()
+     *        as a fallback in that case.
+     * @return {FL, FR, RL, RR} in m/s (0 until the first 0x09 frame arrives).
+     * @note Lock-free atomic read, never blocks; safe at any rate. Because the pushed stream
+     *       never clears the arrival flag, do NOT interleave get_motor_speed_lpf() (the request
+     *       version clears it) once you rely on *fresh.
+     * @see get_motor_speed_lpf, get_motor_encoder, get_accelerometer_data
+     */
+    std::array<double, 4> get_motor_speed_lpf_data(bool * fresh = nullptr) const;
     /**
      * @brief Query the controller's firmware motion-PID gains (blocking round-trip).
      * @return {kp, ki, kd} read back from the board, or {-1,-1,-1} on timeout (~20 ms).
@@ -3745,6 +3764,22 @@ inline std::optional<std::array<double, 4>> Rosmaster::get_motor_speed_lpf() {
     }
     if (debug_) std::cerr << "get_motor_speed_lpf: timeout (firmware < V3.5.1?)\n";
     return std::nullopt;
+}
+
+/** @brief Lock-free snapshot of the PUSHED 0x09 low-pass wheel speeds (m/s). Mirrors
+ *  get_motor_encoder(): reads only atomics receiveLoop fills, no request, no blocking.
+ *  *fresh is an acquire-load of the arrival flag (pairs with parseData's release store of
+ *  the four speeds, so a true flag guarantees the speeds are visible). Once the firmware
+ *  pushes 0x09 at 100 Hz and the driver stops calling get_motor_speed_lpf() (which clears
+ *  the flag), *fresh stays true for the life of the link -- the push/fallback discriminator. */
+inline std::array<double, 4> Rosmaster::get_motor_speed_lpf_data(bool * fresh) const {
+    if (fresh) *fresh = motor_speed_lpf_ok_.load(std::memory_order_acquire);
+    return std::array<double, 4>{
+        motor_speed_lpf_[0].load(std::memory_order_relaxed),
+        motor_speed_lpf_[1].load(std::memory_order_relaxed),
+        motor_speed_lpf_[2].load(std::memory_order_relaxed),
+        motor_speed_lpf_[3].load(std::memory_order_relaxed)
+    };
 }
 
 /** @brief Read back the MCU's OWN motor-PID gains (distinct from this driver's
