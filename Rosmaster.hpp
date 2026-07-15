@@ -5,7 +5,7 @@
 ** Login   <diren.noukpo@epitech.eu>
 **
 ** Started on  Fri May 15 17:18:57 2026 dirennoukpo
-** Last update Thu Jul 15 12:08:53 PM 2026 dirennoukpo
+** Last update Thu Jul 15 3:31:46 PM 2026 dirennoukpo
 */
 
 /**
@@ -704,6 +704,20 @@ public:
      * @see get_motor_speed_lpf, get_motor_encoder, get_accelerometer_data
      */
     std::array<double, 4> get_motor_speed_lpf_data(bool * fresh = nullptr) const;
+    /**
+     * @brief Liveness counters: how many 0x09 (wheel-speed) / motion+battery frames the receive
+     *        thread has DECODED so far. Monotonic (wraps at 2^32, harmless).
+     *
+     * The fix for a stream that FREEZES while the link stays up -- the firmware keeps sending
+     * other frames but stops the 0x09 or the motion/battery one. get_motor_speed_lpf_data()'s
+     * `fresh` and the sticky ok flags only say the frame was EVER seen, not that it is STILL
+     * arriving. Sample a counter once per control cycle: if it has not advanced for a few cycles,
+     * that datum is stale -- fall back (speed -> differentiate get_motor_encoder(); battery ->
+     * hold last + flag; the firmware 8.5 V hard-lock stays the ultimate backstop).
+     * @return decoded-frame count; compare successive reads, do not read absolute meaning into it.
+     */
+    uint32_t get_motor_speed_lpf_seq() const;
+    uint32_t get_battery_seq() const;
     /**
      * @brief Query the controller's firmware motion-PID gains (blocking round-trip).
      * @return {kp, ki, kd} read back from the board, or {-1,-1,-1} on timeout (~20 ms).
@@ -1481,6 +1495,16 @@ private:
     std::atomic<bool>   motor_speed_raw_ok_{false};
     std::atomic<bool>   motor_speed_lpf_ok_{false};
 
+    /// Monotonic arrival counters, bumped by recv_thread_ each time a fresh frame is DECODED
+    /// (not polled). Unlike the sticky *_ok_ latches and battery_voltage_, these let a reader
+    /// detect a STREAM THAT FROZE while the link is still up -- the firmware keeps sending other
+    /// frames but stopped 0x09, or the motion/battery frame. Sample once per control cycle and
+    /// treat the datum as stale if the counter has not advanced for a few cycles. Wrap at 2^32
+    /// is harmless (compare successive reads, never absolute value). Release fetch_add publishes
+    /// after the frame payload, so an acquire-load of the counter sees that payload.
+    std::atomic<uint32_t> motor_speed_lpf_seq_{0};
+    std::atomic<uint32_t> battery_seq_{0};
+
     /// Last bus-servo readback: read_id_ = servo id, read_val_ = raw position value from
     /// a FUNC_UART_SERVO reply. Written by recv_thread_, polled by the app thread; atomics.
     std::atomic<int>    read_id_{0}, read_val_{0};
@@ -1979,6 +2003,9 @@ inline void Rosmaster::parseData(uint8_t ext_type,
         vy_ = le16s(d, 2) / 1000.0;
         vz_ = le16s(d, 4) / 1000.0;
         battery_voltage_ = d[6];
+        // Arrival counter: lets a reader see the motion/battery frame STOP even while the link
+        // stays up. Release so an acquire-load of the counter guarantees the values above.
+        battery_seq_.fetch_add(1, std::memory_order_release);
     }
     // MPU9250: int16 raw counts -> physical units via fixed sensitivity ratios (gyro, accel).
     else if (ext_type == FUNC_REPORT_MPU_RAW) {
@@ -2044,6 +2071,9 @@ inline void Rosmaster::parseData(uint8_t ext_type,
             motor_speed_lpf_[i].store(le16s(d, i * 2) / 1000.0,
                                       std::memory_order_relaxed);
         motor_speed_lpf_ok_.store(true, std::memory_order_release);
+        // Arrival counter (see get_motor_speed_lpf_seq): detects a FROZEN 0x09 stream that the
+        // sticky ok_ capability latch cannot. Release-published after the four speeds.
+        motor_speed_lpf_seq_.fetch_add(1, std::memory_order_release);
         if (debug_) std::cout << "FUNC_REPORT_MOTOR_LPF\n";
     }
     // Bus-servo read-back: d[0] = servo id, le16 at d[1] = position/parameter value.
@@ -3780,6 +3810,16 @@ inline std::array<double, 4> Rosmaster::get_motor_speed_lpf_data(bool * fresh) c
         motor_speed_lpf_[2].load(std::memory_order_relaxed),
         motor_speed_lpf_[3].load(std::memory_order_relaxed)
     };
+}
+
+/** @brief Liveness counters bumped by receiveLoop on each decoded 0x09 / motion-battery frame.
+ *  acquire pairs with the release fetch_add, so the frame's payload is visible once the count is.
+ *  A reader that sees the count stop advancing knows the stream froze even with the link still up. */
+inline uint32_t Rosmaster::get_motor_speed_lpf_seq() const {
+    return motor_speed_lpf_seq_.load(std::memory_order_acquire);
+}
+inline uint32_t Rosmaster::get_battery_seq() const {
+    return battery_seq_.load(std::memory_order_acquire);
 }
 
 /** @brief Read back the MCU's OWN motor-PID gains (distinct from this driver's
